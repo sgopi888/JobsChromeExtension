@@ -362,13 +362,41 @@ async function humanLikeType(element, text) {
     await randomDelay(100, 200);
 }
 
-// Select option from dropdown
+// Select option from dropdown - CLICK-BASED APPROACH
 async function selectOption(element, value) {
+    console.log(`[ContentScript] selectOption: element=${element.tagName}, value="${value}"`);
+
+    // Use the new click-based interaction engine
+    if (window.FieldInteractionEngine) {
+        if (element.tagName === 'SELECT') {
+            // Native select dropdown - use click-based selection
+            const success = await window.FieldInteractionEngine.selectDropdownByClick(element, value);
+            if (success) {
+                console.log('[ContentScript] ✓ Dropdown selected using click-based engine');
+                return;
+            }
+            // If failed, fall through to old method as backup
+            console.warn('[ContentScript] Click-based selection failed, trying fallback');
+        } else {
+            // Autocomplete or custom dropdown
+            const success = await window.FieldInteractionEngine.selectAutocompleteOption(element, value);
+            if (success) {
+                console.log('[ContentScript] ✓ Autocomplete selected using click-based engine');
+                return;
+            }
+            // If failed, fall through to old method as backup
+            console.warn('[ContentScript] Autocomplete selection failed, trying fallback');
+        }
+    } else {
+        console.warn('[ContentScript] FieldInteractionEngine not loaded, using fallback');
+    }
+
+    // FALLBACK: Old method (in case new engine fails)
     element.focus();
     await randomDelay(100, 200);
 
     if (element.tagName === 'SELECT') {
-        // Native select handling
+        // Native select handling (old method)
         const options = Array.from(element.options);
         const match = options.find(opt =>
             opt.value === value ||
@@ -489,8 +517,25 @@ function isVisibleElement(node) {
         style.opacity !== '0';
 }
 
-// Check/uncheck checkbox
+// Check/uncheck checkbox - CLICK-BASED APPROACH
 async function checkBox(element, checked) {
+    console.log(`[ContentScript] checkBox: checked=${checked}`);
+
+    // Use the new click-based interaction engine
+    if (window.FieldInteractionEngine) {
+        const shouldCheck = checked === true || checked === 'true' || checked === '1' || checked === 1;
+        const success = await window.FieldInteractionEngine.setCheckboxByClick(element, shouldCheck);
+        if (success) {
+            console.log('[ContentScript] ✓ Checkbox set using click-based engine');
+            return;
+        }
+        // If failed, fall through to old method as backup
+        console.warn('[ContentScript] Click-based checkbox failed, trying fallback');
+    } else {
+        console.warn('[ContentScript] FieldInteractionEngine not loaded, using fallback');
+    }
+
+    // FALLBACK: Old method (in case new engine fails)
     element.focus();
     await randomDelay(100, 200);
 

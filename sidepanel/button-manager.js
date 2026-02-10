@@ -71,8 +71,9 @@ class ButtonManager {
             }
 
             // Filter only text/email/tel/textarea fields (type action)
+            const textActions = new Set(['type', 'textarea']);
             const textPlan = session.fillPlan.filter(item =>
-                item.action === 'type'
+                textActions.has(String(item.action || '').toLowerCase())
             );
 
             if (textPlan.length === 0) {
@@ -100,8 +101,9 @@ class ButtonManager {
             }
 
             // Filter only select/check/radio fields
+            const menuActions = new Set(['select', 'check', 'radio', 'multiselect']);
             const menuPlan = session.fillPlan.filter(item =>
-                item.action === 'select' || item.action === 'check'
+                menuActions.has(String(item.action || '').toLowerCase())
             );
 
             if (menuPlan.length === 0) {

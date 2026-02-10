@@ -9,40 +9,45 @@ let currentFillPlan = [];
 let captchaDetected = false;
 const captchaEnabled = false;
 
-// Listen for messages from background/sidepanel
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('Content script received:', message.action);
+if (!window.__JOBS_AI_LISTENER_ATTACHED__) {
+    // Listen for messages from background/sidepanel
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        console.log('Content script received:', message.action);
 
-    switch (message.action) {
-        case 'scanPage':
-            handleScanPage(sendResponse);
-            return true;
+        switch (message.action) {
+            case 'scanPage':
+                handleScanPage(sendResponse);
+                return true;
 
-        case 'startFilling':
-            handleStartFilling(message.data, sendResponse);
-            return true;
+            case 'startFilling':
+                handleStartFilling(message.data, sendResponse);
+                return true;
 
-        case 'pause':
-            isPaused = true;
-            sendResponse({ success: true });
-            break;
+            case 'pause':
+                isPaused = true;
+                sendResponse({ success: true });
+                break;
 
-        case 'resume':
-            isPaused = false;
-            if (currentFillPlan.length > 0) {
-                continueFilling();
-            }
-            sendResponse({ success: true });
-            break;
+            case 'resume':
+                isPaused = false;
+                if (currentFillPlan.length > 0) {
+                    continueFilling();
+                }
+                sendResponse({ success: true });
+                break;
 
-        case 'detectCaptcha':
-            detectCaptcha(sendResponse);
-            return true;
+            case 'detectCaptcha':
+                detectCaptcha(sendResponse);
+                return true;
 
-        default:
-            return false;
-    }
-});
+            default:
+                return false;
+        }
+    });
+    window.__JOBS_AI_LISTENER_ATTACHED__ = true;
+} else {
+    console.log('[JobsAI] Message listener already attached; skipping duplicate setup');
+}
 
 // Scan page for form fields
 async function handleScanPage(sendResponse) {
@@ -74,11 +79,16 @@ async function detectFormFields() {
         }
 
         const generatedId = element.id || generateFieldId(element);
+        const controlType = detectControlType(element);
+        const normalizedType = controlType === 'menu'
+            ? 'select'
+            : (element.type || element.tagName.toLowerCase());
         
         const field = {
             id: generatedId,
             name: element.name || '',
-            type: element.type || element.tagName.toLowerCase(),
+            type: normalizedType,
+            controlType,
             label: getFieldLabel(element),
             placeholder: element.placeholder || '',
             required: element.required || element.hasAttribute('aria-required'),
@@ -99,6 +109,11 @@ async function detectFormFields() {
             }));
         }
 
+        // For custom menu controls, collect visible options if present in DOM
+        if (controlType === 'menu' && field.options.length === 0) {
+            field.options = extractMenuOptions(element);
+        }
+
         // For radio buttons, get all options in the group
         if (element.type === 'radio') {
             const radioGroup = document.querySelectorAll(`input[name="${element.name}"]`);
@@ -108,6 +123,7 @@ async function detectFormFields() {
             }));
         }
 
+        console.log(`[DEBUG] Field controlType="${field.controlType}", type="${field.type}", options=${field.options.length}`);
         fields.push(field);
     }
 
@@ -133,6 +149,56 @@ async function detectFormFields() {
     }
 
     return fields;
+}
+
+function detectControlType(element) {
+    if (!element) return 'text';
+
+    const tag = element.tagName.toLowerCase();
+    const type = (element.type || '').toLowerCase();
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
+    const placeholder = (element.placeholder || '').toLowerCase();
+    const id = (element.id || '').toLowerCase();
+
+    if (tag === 'select') return 'menu';
+    if (type === 'checkbox') return 'checkbox';
+    if (type === 'radio') return 'radio';
+    if (tag === 'textarea') return 'textarea';
+
+    const isCustomMenu = role === 'combobox' ||
+        ariaHaspopup === 'listbox' ||
+        id.startsWith('field_select____') ||
+        placeholder === 'select...' ||
+        element.closest('[role="combobox"], [aria-haspopup="listbox"], [data-testid*="select"]');
+
+    if (isCustomMenu) return 'menu';
+
+    return 'text';
+}
+
+function extractMenuOptions(element) {
+    const options = [];
+    const addOption = (value, text) => {
+        if (!text) return;
+        if (options.some(opt => opt.text === text)) return;
+        options.push({ value: value || text, text });
+    };
+
+    const listboxId = element.getAttribute('aria-controls');
+    const scopedRoot = listboxId ? document.getElementById(listboxId) : null;
+    const questionRoot = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question');
+    const scanRoot = scopedRoot || questionRoot || element.parentElement || document;
+    const optionNodes = Array.from(scanRoot.querySelectorAll('[role="option"], [role="menuitem"], option'))
+        .filter(node => node.tagName === 'OPTION' || isVisibleElement(node));
+
+    for (const node of optionNodes) {
+        const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        addOption(node.value, text);
+    }
+
+    return options;
 }
 
 // Get label for a field
@@ -303,7 +369,7 @@ async function executeFillPlan(fillPlan) {
 
 // Fill a single field based on action type
 async function fillField(item) {
-    const element = findElement(item.fieldId);
+    const element = findElement(item.fieldId, item.action);
 
     if (!element) {
         throw new Error(`Element not found: ${item.fieldId}`);
@@ -323,7 +389,7 @@ async function fillField(item) {
             break;
 
         case 'check':
-            await checkBox(element, item.value);
+            await checkBox(element, item);
             break;
 
         case 'upload':
@@ -377,15 +443,21 @@ async function selectOption(element, value) {
             }
             // If failed, fall through to old method as backup
             console.warn('[ContentScript] Click-based selection failed, trying fallback');
-        } else {
-            // Autocomplete or custom dropdown
+        } else if (
+            element.tagName === 'INPUT' ||
+            element.tagName === 'TEXTAREA' ||
+            (element.getAttribute('role') || '').toLowerCase() === 'combobox'
+        ) {
+            // Autocomplete or text-backed custom dropdown
             const success = await window.FieldInteractionEngine.selectAutocompleteOption(element, value);
             if (success) {
                 console.log('[ContentScript] ✓ Autocomplete selected using click-based engine');
                 return;
             }
-            // If failed, fall through to old method as backup
+            // If failed, fall through to custom click fallback
             console.warn('[ContentScript] Autocomplete selection failed, trying fallback');
+        } else {
+            console.log('[ContentScript] Non-input menu trigger detected; using custom click fallback');
         }
     } else {
         console.warn('[ContentScript] FieldInteractionEngine not loaded, using fallback');
@@ -425,11 +497,14 @@ async function selectCustomOption(element, value) {
     }
 
     const trigger = findMenuTrigger(element);
-    trigger.click();
     trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    trigger.click();
     await randomDelay(150, 300);
 
-    let option = findVisibleOptionByText(targetValue);
+    const listboxId = trigger.getAttribute('aria-controls') || element.getAttribute('aria-controls');
+    const scopedRoot = listboxId ? document.getElementById(listboxId) : null;
+    let option = findVisibleOptionByText(targetValue, scopedRoot || document);
     if (!option) {
         option = findInlineChoice(element, targetValue);
     }
@@ -464,7 +539,7 @@ function findMenuTrigger(element) {
     return nearby || element;
 }
 
-function findVisibleOptionByText(targetText) {
+function findVisibleOptionByText(targetText, rootNode = document) {
     const optionSelectors = [
         '[role="option"]',
         '[role="menuitem"]',
@@ -473,7 +548,7 @@ function findVisibleOptionByText(targetText) {
         '.select__option'
     ];
 
-    const candidates = Array.from(document.querySelectorAll(optionSelectors.join(', ')))
+    const candidates = Array.from(rootNode.querySelectorAll(optionSelectors.join(', ')))
         .filter(isVisibleElement)
         .filter(node => normalizeOptionText(node.textContent));
 
@@ -518,12 +593,12 @@ function isVisibleElement(node) {
 }
 
 // Check/uncheck checkbox - CLICK-BASED APPROACH
-async function checkBox(element, checked) {
-    console.log(`[ContentScript] checkBox: checked=${checked}`);
+async function checkBox(element, item) {
+    const shouldCheck = normalizeShouldBeChecked(item);
+    console.log(`[ContentScript] checkBox: shouldCheck=${shouldCheck}`);
 
     // Use the new click-based interaction engine
     if (window.FieldInteractionEngine) {
-        const shouldCheck = checked === true || checked === 'true' || checked === '1' || checked === 1;
         const success = await window.FieldInteractionEngine.setCheckboxByClick(element, shouldCheck);
         if (success) {
             console.log('[ContentScript] ✓ Checkbox set using click-based engine');
@@ -539,7 +614,7 @@ async function checkBox(element, checked) {
     element.focus();
     await randomDelay(100, 200);
 
-    if (element.checked !== checked) {
+    if (element.checked !== shouldCheck) {
         element.click();
         await randomDelay(50, 100);
     }
@@ -547,9 +622,27 @@ async function checkBox(element, checked) {
     element.blur();
 }
 
+function normalizeShouldBeChecked(item) {
+    const action = String(item?.action || '').toLowerCase();
+    if (action === 'check') return true;
+    if (action === 'uncheck') return false;
+
+    const value = item?.value;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value === 1;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        return ['true', '1', 'yes', 'y', 'checked'].includes(normalized);
+    }
+    return true;
+}
+
 // Find element by ID or fallback methods
-function findElement(fieldId) {
-    console.log(`[DEBUG] Looking for element with fieldId: ${fieldId}`);
+function findElement(fieldId, action = '') {
+    console.log(`[DEBUG] Looking for element with fieldId: ${fieldId}, action=${action}`);
+    const actionType = String(action || '').toLowerCase();
+    const isMenuAction = actionType === 'select';
+    const isBooleanAction = actionType === 'check' || actionType === 'radio';
     
     // Get stored metadata for this field
     const fieldData = window.fieldMetadata ? window.fieldMetadata[fieldId] : null;
@@ -577,14 +670,28 @@ function findElement(fieldId) {
         
         // Try stored selector
         if (fieldData.selector) {
-            try {
-                let element = document.querySelector(fieldData.selector);
-                if (element) {
-                    console.log(`[DEBUG] Found element by selector: ${fieldData.selector}`);
-                    return element;
+            if ((isMenuAction || isBooleanAction) && isGenericSelector(fieldData.selector)) {
+                console.log(`[DEBUG] Skipping generic selector for ${actionType}: ${fieldData.selector}`);
+            } else {
+                try {
+                    let element = document.querySelector(fieldData.selector);
+                    if (element) {
+                        if (isMenuAction) {
+                            element = resolveAssociatedMenuElement(element);
+                            if (!element) {
+                                console.warn(`[DEBUG] Selector resolved non-menu element for ${fieldId}`);
+                            } else {
+                                console.log(`[DEBUG] Found menu element by selector: ${fieldData.selector}`);
+                                return element;
+                            }
+                        } else {
+                            console.log(`[DEBUG] Found element by selector: ${fieldData.selector}`);
+                            return element;
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[DEBUG] Invalid selector: ${fieldData.selector}`, e);
                 }
-            } catch (e) {
-                console.warn(`[DEBUG] Invalid selector: ${fieldData.selector}`, e);
             }
         }
     }
@@ -595,26 +702,96 @@ function findElement(fieldId) {
     // Try direct ID
     let element = document.getElementById(fieldId);
     if (element) {
-        console.log(`[DEBUG] Found element by direct ID`);
-        return element;
+        if (isMenuAction) {
+            const menuElement = resolveAssociatedMenuElement(element);
+            if (menuElement) {
+                console.log(`[DEBUG] Found menu element by direct ID`);
+                return menuElement;
+            }
+            console.warn(`[DEBUG] Direct ID is not a menu control for ${fieldId}`);
+        } else {
+            console.log(`[DEBUG] Found element by direct ID`);
+            return element;
+        }
     }
 
     // Try name attribute
     element = document.querySelector(`[name="${fieldId}"]`);
     if (element) {
-        console.log(`[DEBUG] Found element by name attribute`);
-        return element;
+        if (isMenuAction) {
+            const menuElement = resolveAssociatedMenuElement(element);
+            if (menuElement) {
+                console.log(`[DEBUG] Found menu element by name attribute`);
+                return menuElement;
+            }
+            console.warn(`[DEBUG] Name attribute resolved non-menu element for ${fieldId}`);
+        } else {
+            console.log(`[DEBUG] Found element by name attribute`);
+            return element;
+        }
     }
 
     // Try data attribute
     element = document.querySelector(`[data-field-id="${fieldId}"]`);
     if (element) {
-        console.log(`[DEBUG] Found element by data attribute`);
-        return element;
+        if (isMenuAction) {
+            const menuElement = resolveAssociatedMenuElement(element);
+            if (menuElement) {
+                console.log(`[DEBUG] Found menu element by data attribute`);
+                return menuElement;
+            }
+            console.warn(`[DEBUG] Data attribute resolved non-menu element for ${fieldId}`);
+        } else {
+            console.log(`[DEBUG] Found element by data attribute`);
+            return element;
+        }
+    }
+
+    // Do not fallback to broad selectors for menu/checkbox/radio actions
+    if (isMenuAction || isBooleanAction) {
+        console.warn(`[DEBUG] Strict lookup failed for ${actionType} field: ${fieldId}`);
+        return null;
     }
 
     console.error(`[DEBUG] Element not found for fieldId: ${fieldId}`);
     return null;
+}
+
+function isGenericSelector(selector = '') {
+    const trimmed = selector.trim().toLowerCase();
+    return trimmed === 'input' ||
+        trimmed === 'textarea' ||
+        trimmed === 'select' ||
+        trimmed === 'input[type="text"]' ||
+        trimmed.startsWith('input[type="text"]:nth-of-type');
+}
+
+function resolveAssociatedMenuElement(element) {
+    if (!element) return null;
+    if (isMenuLikeElement(element)) return element;
+
+    const questionRoot = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question') ||
+        element.closest('label, div') ||
+        document;
+
+    const candidates = Array.from(questionRoot.querySelectorAll(
+        '[role="combobox"], [aria-haspopup="listbox"], button[aria-haspopup="listbox"], select, [id^="field_select____"]'
+    ));
+
+    const visibleCandidate = candidates.find(node => isMenuLikeElement(node));
+    return visibleCandidate || null;
+}
+
+function isMenuLikeElement(element) {
+    if (!element) return false;
+    if (element.tagName === 'SELECT') return true;
+
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    const ariaHasPopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
+    const id = (element.id || '').toLowerCase();
+    return role === 'combobox' ||
+        ariaHasPopup === 'listbox' ||
+        id.startsWith('field_select____');
 }
 
 // Detect CAPTCHA on page - only if visible and active
@@ -710,13 +887,15 @@ function logAction(data) {
 }
 
 // Periodic captcha check
-setInterval(async () => {
-    if (isProcessing && !isPaused) {
-        const detected = await detectCaptchaSync();
-        if (detected && !captchaDetected) {
-            captchaDetected = true;
-            isPaused = true;
-            notifySidePanel({ type: 'captcha_detected' });
+if (!window.__JOBS_AI_CAPTCHA_INTERVAL__) {
+    window.__JOBS_AI_CAPTCHA_INTERVAL__ = setInterval(async () => {
+        if (isProcessing && !isPaused) {
+            const detected = await detectCaptchaSync();
+            if (detected && !captchaDetected) {
+                captchaDetected = true;
+                isPaused = true;
+                notifySidePanel({ type: 'captcha_detected' });
+            }
         }
-    }
-}, 2000);
+    }, 2000);
+}

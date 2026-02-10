@@ -77,10 +77,24 @@ function inferControlType(field) {
 }
 
 function normalizeFieldsForAnalysis(fields) {
-  return fields.map(field => ({
+  const normalized = fields.map(field => ({
     ...field,
     controlType: inferControlType(field)
   }));
+
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    const current = normalized[index];
+    const next = normalized[index + 1];
+    const nextIsSelectProxy = next?.controlType === 'menu' &&
+      normalizeText(next.label).toLowerCase() === 'select...' &&
+      normalizeText(next.id).toLowerCase().startsWith('field_select____');
+
+    if (nextIsSelectProxy && current.controlType === 'text') {
+      current.controlType = 'menu_prompt';
+    }
+  }
+
+  return normalized;
 }
 
 function getContextFacts(userContext) {
@@ -189,6 +203,7 @@ function inferSelectValue(field, facts) {
 }
 
 function inferFieldValue(field, facts) {
+  if (field.controlType === 'menu_prompt') return '';
   if (field.controlType === 'menu') return inferSelectValue(field, facts);
   if (field.controlType === 'checkbox' || field.controlType === 'radio') return true;
   if (field.controlType === 'textarea' || field.controlType === 'text') return inferTextValue(field, facts);
@@ -196,6 +211,7 @@ function inferFieldValue(field, facts) {
 }
 
 function inferAction(field) {
+  if (field.controlType === 'menu_prompt') return 'skip';
   if (field.controlType === 'menu') return 'select';
   if (field.controlType === 'checkbox' || field.controlType === 'radio') return 'check';
   if (field.controlType === 'file') return 'upload';
@@ -214,6 +230,9 @@ function sanitizeAndBackfillFillPlan(rawPlan, fields, userContext) {
   for (const item of existingPlan) {
     if (!item?.fieldId || !fieldMap.has(item.fieldId)) continue;
     const field = fieldMap.get(item.fieldId);
+    if (field.controlType === 'menu_prompt') {
+      continue;
+    }
     let action = normalizeText(item.action).toLowerCase();
     if (!validActions.has(action)) {
       action = inferAction(field);
@@ -247,6 +266,7 @@ function sanitizeAndBackfillFillPlan(rawPlan, fields, userContext) {
     const required = Boolean(field.required);
     if (!required) continue;
     if (field.controlType === 'file') continue;
+    if (field.controlType === 'menu_prompt') continue;
     if (covered.has(field.id)) continue;
 
     const action = inferAction(field);
@@ -396,7 +416,11 @@ app.post('/api/analyze-fields', async (req, res) => {
     }
 
     const normalizedFields = normalizeFieldsForAnalysis(fields);
-    const requiredNonFileFields = normalizedFields.filter(field => field.required && field.controlType !== 'file');
+    const requiredNonFileFields = normalizedFields.filter(field =>
+      field.required &&
+      field.controlType !== 'file' &&
+      field.controlType !== 'menu_prompt'
+    );
 
     console.log('\n========== 🔍 FIELD ANALYSIS REQUEST ==========');
     console.log(`📊 Total fields: ${normalizedFields.length}`);
@@ -438,6 +462,7 @@ app.post('/api/analyze-fields', async (req, res) => {
 CRITICAL RULES:
 1. USE THE DATA YOU HAVE - Don't ask for information already in the user context.
 2. Return one plan item for every REQUIRED field unless it is a file upload field.
+2b. Ignore fields where controlType is "menu_prompt" because they are label proxies for adjacent dropdown controls.
 3. If field.controlType is "menu", action MUST be "select" (never "type").
 4. If field.controlType is "checkbox" or "radio", action MUST be "check".
 5. For text/textarea, action MUST be "type".
@@ -500,7 +525,9 @@ Fill all required non-file fields. Match action to controlType and prefer determ
         generatedPlanItems: fillPlan.length,
         requiredCovered: fillPlan.filter(item => {
           const field = normalizedFields.find(f => f.id === item.fieldId);
-          return field?.required && field.controlType !== 'file';
+          return field?.required &&
+            field.controlType !== 'file' &&
+            field.controlType !== 'menu_prompt';
         }).length
       }
     };

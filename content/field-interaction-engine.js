@@ -98,47 +98,51 @@ async function selectDropdownByClick(selectElement, targetValue) {
 async function selectAutocompleteOption(inputElement, value) {
     console.log(`[InteractionEngine] selectAutocompleteOption: "${value}"`);
 
+    const targetValue = normalizeText(value);
+    if (!targetValue) {
+        console.warn('[InteractionEngine] Empty target value for autocomplete selection');
+        return false;
+    }
+
     inputElement.focus();
     await delay(100);
 
-    // Type value to trigger dropdown
-    inputElement.value = value;
+    // Open menu using real click and keyboard
+    realClick(inputElement);
+    inputElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowDown' }));
+    await delay(120);
+
+    // Type value to filter options
+    inputElement.value = '';
     inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-    inputElement.dispatchEvent(new Event('keydown', { bubbles: true, key: 'ArrowDown' }));
+    for (const char of String(value)) {
+        inputElement.value += char;
+        inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+        await delay(20);
+    }
+    await delay(220);
 
-    // Wait for menu to appear
-    await delay(500);
+    const listboxRoot = resolveListboxRoot(inputElement);
+    const options = getVisibleOptions(listboxRoot);
+    const match = findBestOptionMatch(options, targetValue);
 
-    // Find and click menu option
-    const optionSelectors = [
-        '[role="option"]',
-        '[role="menuitem"]',
-        '.menu-item',
-        '.autocomplete-item',
-        '.dropdown-item',
-        '[data-option]'
-    ];
-
-    for (const selector of optionSelectors) {
-        const options = Array.from(document.querySelectorAll(selector));
-        const match = options.find(opt => {
-            const text = opt.textContent.trim().toLowerCase();
-            const target = String(value).toLowerCase();
-            return text.includes(target) || text === target;
-        });
-
-        if (match && isVisible(match)) {
-            console.log(`[InteractionEngine] Found menu option: "${match.textContent.trim()}"`);
-            realClick(match);
-            await delay(100);
-            return true;
-        }
+    if (!match) {
+        console.warn('[InteractionEngine] No menu option found for:', value, 'available:', options.map(opt => opt.textContent.trim()));
+        return false;
     }
 
-    // If no menu appeared, just keep the typed value
-    console.log('[InteractionEngine] No menu option found, keeping typed value');
-    inputElement.dispatchEvent(new Event('change', { bubbles: true }));
-    inputElement.blur();
+    console.log(`[InteractionEngine] Found menu option: "${match.textContent.trim()}"`);
+    match.scrollIntoView({ block: 'nearest' });
+    realClick(match);
+    await delay(120);
+
+    // Verify that control displays selected text
+    const selected = normalizeText(inputElement.value || inputElement.textContent || '');
+    if (selected && (selected === targetValue || selected.includes(targetValue) || targetValue.includes(selected))) {
+        return true;
+    }
+
+    // Some widgets keep selected value outside input element; trust click if option was visible and clicked
     return true;
 }
 
@@ -204,13 +208,28 @@ async function selectRadioByClick(name, value) {
 async function setCheckboxByClick(checkboxElement, shouldBeChecked = true) {
     console.log(`[InteractionEngine] setCheckboxByClick: shouldBeChecked=${shouldBeChecked}`);
 
-    if (!checkboxElement || checkboxElement.type !== 'checkbox') {
-        console.error('[InteractionEngine] Not a checkbox element');
+    if (!checkboxElement || (checkboxElement.type !== 'checkbox' && checkboxElement.type !== 'radio')) {
+        console.error('[InteractionEngine] Not a checkbox/radio element');
         return false;
     }
 
     const currentlyChecked = checkboxElement.checked;
     console.log(`[InteractionEngine] Current state: ${currentlyChecked}`);
+
+    if (checkboxElement.type === 'radio') {
+        if (!shouldBeChecked) {
+            return true;
+        }
+
+        if (!currentlyChecked) {
+            checkboxElement.focus();
+            await delay(100);
+            realClick(checkboxElement);
+            checkboxElement.dispatchEvent(new Event('change', { bubbles: true }));
+            console.log('[InteractionEngine] ✓ Radio checked');
+        }
+        return true;
+    }
 
     // Only click if state needs to change
     if (currentlyChecked !== shouldBeChecked) {
@@ -361,6 +380,57 @@ function isVisible(element) {
            parseFloat(style.opacity) > 0;
 }
 
+function normalizeText(value) {
+    return String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function resolveListboxRoot(inputElement) {
+    const ariaControls = inputElement.getAttribute('aria-controls');
+    if (ariaControls) {
+        const byId = document.getElementById(ariaControls);
+        if (byId) {
+            return byId;
+        }
+    }
+
+    const expandedRegion = inputElement.closest('[aria-expanded="true"], [role="combobox"]');
+    const scopedListbox = expandedRegion?.querySelector('[role="listbox"]');
+    if (scopedListbox) {
+        return scopedListbox;
+    }
+
+    return document;
+}
+
+function getVisibleOptions(rootNode) {
+    const optionSelectors = [
+        '[role="option"]',
+        '[role="menuitem"]',
+        '.menu-item',
+        '.autocomplete-item',
+        '.dropdown-item',
+        '[data-option]',
+        '[id*="option"]'
+    ];
+
+    return Array.from(rootNode.querySelectorAll(optionSelectors.join(', ')))
+        .filter(isVisible)
+        .filter(opt => normalizeText(opt.textContent));
+}
+
+function findBestOptionMatch(options, targetValue) {
+    const exact = options.find(opt => normalizeText(opt.textContent) === targetValue);
+    if (exact) return exact;
+
+    const startsWith = options.find(opt => normalizeText(opt.textContent).startsWith(targetValue));
+    if (startsWith) return startsWith;
+
+    return options.find(opt => normalizeText(opt.textContent).includes(targetValue)) || null;
+}
+
 /**
  * UTILITY: Delay helper
  */
@@ -394,7 +464,7 @@ async function applyFieldAction(fieldType, element, value, actionType = 'type') 
                 }
 
             case 'check':
-                const shouldCheck = value === true || value === 'true' || value === '1' || value === 1;
+                const shouldCheck = normalizeCheckboxIntent(value, actionType);
                 return await setCheckboxByClick(element, shouldCheck);
 
             case 'radio':
@@ -445,3 +515,21 @@ window.FieldInteractionEngine = {
 };
 
 console.log('[InteractionEngine] ✓ Module ready - All interaction methods exported');
+
+function normalizeCheckboxIntent(value, actionType) {
+    const action = String(actionType || '').toLowerCase();
+    if (action === 'check') {
+        return true;
+    }
+    if (action === 'uncheck') {
+        return false;
+    }
+
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value === 1;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        return ['true', '1', 'yes', 'y', 'checked'].includes(normalized);
+    }
+    return true;
+}

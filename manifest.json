@@ -19,7 +19,13 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content/content-script.js"],
+      "js": [
+        "content/unified-logger.js",
+        "content/field-metadata-manager.js",
+        "content/content-script.js",
+        "content/phase2-resume.js",
+        "content/phase3-auto-upload.js"
+      ],
       "run_at": "document_idle"
     }
   ],

@@ -74,7 +74,11 @@ async function analyzeFields(fields) {
             addSystemMessage(`Warnings: ${response.warnings.join(', ')}`);
         }
 
-        fillBtn.disabled = false;
+        // Enable split fill buttons if available
+        if (window.ButtonManager) {
+            window.ButtonManager.enableButtons();
+        }
+        fillBtn.disabled = false; // Keep for backward compatibility
         updateStatus('Ready');
     } else {
         addSystemMessage('Error analyzing fields', 'error');

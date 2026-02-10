@@ -171,14 +171,15 @@ Fill ALL fields using available data. Don't ask for data you already have.`;
     console.log(`   Missing info: ${result.missingInfo?.length || 0}`);
     console.log(`   Warnings: ${result.warnings?.length || 0}`);
 
-    // Log fill plan
+    // Log fill plan (NO TRUNCATION)
     console.log('\n📋 FILL PLAN:');
     result.fillPlan?.forEach((item, i) => {
-      const valuePreview = typeof item.value === 'string' && item.value.length > 50
-        ? item.value.substring(0, 50) + '...'
-        : item.value;
+      const valuePreview = item.value; // NO TRUNCATION
+      const valueSummary = typeof item.value === 'string' && item.value.length > 100
+        ? ` (${item.value.length} characters)`
+        : '';
       console.log(`   ${i + 1}. ${item.action.toUpperCase()}: ${item.fieldId}`);
-      console.log(`      Value: "${valuePreview}"`);
+      console.log(`      Value: "${valuePreview}"${valueSummary}`);
       console.log(`      Confidence: ${item.confidence} - ${item.reasoning}`);
     });
 

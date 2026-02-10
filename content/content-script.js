@@ -111,6 +111,26 @@ async function detectFormFields() {
     }
 
     console.log(`[DEBUG] Total fields detected: ${fields.length}`);
+
+    // Log full scan results for user visibility
+    if (window.logFull) {
+        window.logFull('COMPLETE FIELD SCAN RESULTS', {
+            totalFields: fields.length,
+            timestamp: new Date().toISOString(),
+            pageUrl: window.location.href,
+            fields: fields.map(f => ({
+                id: f.id,
+                label: f.label,
+                type: f.type,
+                name: f.name,
+                required: f.required,
+                hasOptions: f.options && f.options.length > 0,
+                optionCount: f.options ? f.options.length : 0,
+                options: f.options || []
+            }))
+        });
+    }
+
     return fields;
 }
 

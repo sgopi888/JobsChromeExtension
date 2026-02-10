@@ -84,6 +84,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             handleLogAction(message.data, sendResponse);
             return true;
 
+        case 'logToUI':
+            // Log relay: Forward logs from content script to sidepanel
+            chrome.runtime.sendMessage({
+                action: 'displayLog',
+                data: message.data
+            }).catch(() => {
+                // Sidepanel not open, ignore silently
+            });
+            sendResponse({ success: true });
+            return false;
+
         default:
             sendResponse({ error: 'Unknown action' });
     }
@@ -101,6 +112,29 @@ async function handleAnalyzeFields(data, sendResponse) {
             resumeText: stored.profile.resumeText || ''
         };
 
+        // Log full LLM request context
+        chrome.runtime.sendMessage({
+            action: 'displayLog',
+            data: {
+                level: 'info',
+                message: JSON.stringify({
+                    title: 'LLM REQUEST CONTEXT',
+                    fieldsCount: fields.length,
+                    fieldTypes: fields.reduce((acc, f) => {
+                        acc[f.type] = (acc[f.type] || 0) + 1;
+                        return acc;
+                    }, {}),
+                    profile: userContext.profile || {},
+                    qaLibrary: userContext.qaLibrary || {},
+                    resumeLength: userContext.resumeText?.length || 0,
+                    sessionId: stored.session.sessionId
+                }, null, 2),
+                timestamp: new Date().toISOString(),
+                location: 'service-worker',
+                type: 'detailed'
+            }
+        }).catch(() => {});
+
         const response = await fetch(`${API_BASE}/analyze-fields`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -116,6 +150,25 @@ async function handleAnalyzeFields(data, sendResponse) {
         }
 
         const result = await response.json();
+
+        // Log full LLM response (no truncation)
+        chrome.runtime.sendMessage({
+            action: 'displayLog',
+            data: {
+                level: 'info',
+                message: JSON.stringify({
+                    title: 'LLM RESPONSE (COMPLETE - NO TRUNCATION)',
+                    fillPlan: result.fillPlan || [],
+                    fillPlanCount: result.fillPlan?.length || 0,
+                    missingInfo: result.missingInfo || [],
+                    warnings: result.warnings || [],
+                    responseFields: Object.keys(result)
+                }, null, 2),
+                timestamp: new Date().toISOString(),
+                location: 'service-worker',
+                type: 'detailed'
+            }
+        }).catch(() => {});
 
         // Update session with fill plan
         await chrome.storage.local.set({

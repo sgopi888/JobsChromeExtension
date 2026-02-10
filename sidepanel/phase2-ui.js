@@ -79,7 +79,7 @@ function initResumeUpload() {
             reader.onload = async (e) => {
                 const base64Data = e.target.result;
                 
-                // Store in chrome.storage
+                // Store file payload
                 await chrome.storage.local.set({
                     resumeFile: {
                         name: file.name,
@@ -88,6 +88,16 @@ function initResumeUpload() {
                         text: result.resumeText,
                         metadata: result.metadata,
                         uploadedAt: new Date().toISOString()
+                    }
+                });
+
+                // Also store parsed text in profile for LLM context continuity
+                const existing = await chrome.storage.local.get('profile');
+                await chrome.storage.local.set({
+                    profile: {
+                        ...(existing.profile || {}),
+                        resumeText: result.resumeText,
+                        resumeMetadata: result.metadata
                     }
                 });
                 
@@ -104,7 +114,7 @@ function initResumeUpload() {
                 uploadResumeBtn.disabled = false;
                 
                 // Update context display
-                updateContextDisplay('resumeContext', result.resumeText.substring(0, 500) + '...');
+                updateContextDisplay('resumeContext', result.resumeText);
             };
             
             reader.readAsDataURL(file);
@@ -174,7 +184,7 @@ async function loadResumeStatus() {
             
             // Update context display
             if (resume.text) {
-                updateContextDisplay('resumeContext', resume.text.substring(0, 500) + '...');
+                updateContextDisplay('resumeContext', resume.text);
             }
         } else {
             resumeStatus.textContent = 'No resume uploaded';
@@ -196,7 +206,6 @@ function initEnhancedProfile() {
     const saveProfileBtn = document.getElementById('saveProfileBtn');
     
     if (!saveProfileBtn) {
-        console.warn('[Phase2-UI] Save profile button not found');
         return;
     }
     

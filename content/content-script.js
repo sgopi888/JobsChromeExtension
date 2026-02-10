@@ -7,6 +7,7 @@ let isPaused = false;
 let isProcessing = false;
 let currentFillPlan = [];
 let captchaDetected = false;
+const captchaEnabled = false;
 
 // Listen for messages from background/sidepanel
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -39,7 +40,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return true;
 
         default:
-            sendResponse({ error: 'Unknown action' });
+            return false;
     }
 });
 
@@ -366,22 +367,126 @@ async function selectOption(element, value) {
     element.focus();
     await randomDelay(100, 200);
 
-    // Find matching option
-    const options = Array.from(element.options);
-    const match = options.find(opt =>
-        opt.value === value ||
-        opt.text.toLowerCase().includes(value.toLowerCase())
-    );
+    if (element.tagName === 'SELECT') {
+        // Native select handling
+        const options = Array.from(element.options);
+        const match = options.find(opt =>
+            opt.value === value ||
+            opt.text.toLowerCase().includes(String(value).toLowerCase())
+        );
 
-    if (match) {
-        element.value = match.value;
-        element.dispatchEvent(new Event('change', { bubbles: true }));
+        if (match) {
+            element.value = match.value;
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            throw new Error(`Option not found: ${value}`);
+        }
     } else {
-        throw new Error(`Option not found: ${value}`);
+        // Custom menu handling (combobox, listbox, button menus)
+        await selectCustomOption(element, value);
     }
 
     element.blur();
     await randomDelay(100, 200);
+}
+
+async function selectCustomOption(element, value) {
+    const targetValue = normalizeOptionText(value);
+    if (!targetValue) {
+        throw new Error(`Invalid option value: ${value}`);
+    }
+
+    const trigger = findMenuTrigger(element);
+    trigger.click();
+    trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    await randomDelay(150, 300);
+
+    let option = findVisibleOptionByText(targetValue);
+    if (!option) {
+        option = findInlineChoice(element, targetValue);
+    }
+
+    if (!option) {
+        throw new Error(`Custom option not found: ${value}`);
+    }
+
+    option.click();
+    option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+    if (typeof element.value === 'string' && !element.value) {
+        element.value = option.textContent.trim();
+    }
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function findMenuTrigger(element) {
+    const selector = [
+        '[role="combobox"]',
+        'button[aria-haspopup="listbox"]',
+        'button[aria-haspopup="menu"]',
+        '[aria-haspopup="listbox"]'
+    ].join(', ');
+
+    if (element.matches(selector)) {
+        return element;
+    }
+
+    const nearby = element.closest('label, div, fieldset')?.querySelector(selector);
+    return nearby || element;
+}
+
+function findVisibleOptionByText(targetText) {
+    const optionSelectors = [
+        '[role="option"]',
+        '[role="menuitem"]',
+        '[role="menuitemradio"]',
+        '[role="listbox"] [tabindex]',
+        '.select__option'
+    ];
+
+    const candidates = Array.from(document.querySelectorAll(optionSelectors.join(', ')))
+        .filter(isVisibleElement)
+        .filter(node => normalizeOptionText(node.textContent));
+
+    return pickBestOptionMatch(candidates, targetText);
+}
+
+function findInlineChoice(element, targetText) {
+    const questionRoot = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question') || document;
+    const inlineCandidates = Array.from(questionRoot.querySelectorAll('button, label, [role="radio"], [role="button"]'))
+        .filter(isVisibleElement)
+        .filter(node => normalizeOptionText(node.textContent));
+
+    return pickBestOptionMatch(inlineCandidates, targetText);
+}
+
+function pickBestOptionMatch(candidates, targetText) {
+    const exact = candidates.find(node => normalizeOptionText(node.textContent) === targetText);
+    if (exact) return exact;
+
+    const startsWith = candidates.find(node => normalizeOptionText(node.textContent).startsWith(targetText));
+    if (startsWith) return startsWith;
+
+    return candidates.find(node => normalizeOptionText(node.textContent).includes(targetText)) || null;
+}
+
+function normalizeOptionText(text) {
+    return String(text || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function isVisibleElement(node) {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+
+    return rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        style.opacity !== '0';
 }
 
 // Check/uncheck checkbox
@@ -469,6 +574,9 @@ function findElement(fieldId) {
 
 // Detect CAPTCHA on page - only if visible and active
 async function detectCaptchaSync() {
+    if (!captchaEnabled) {
+        return false;
+    }
     // Check for common captcha indicators
     const captchaSelectors = [
         'iframe[src*="recaptcha"]',

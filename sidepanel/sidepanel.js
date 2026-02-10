@@ -15,6 +15,8 @@ const chatMessages = document.getElementById('chatMessages');
 const logMessages = document.getElementById('logMessages');
 const autoContinue = document.getElementById('autoContinue');
 const autoSubmit = document.getElementById('autoSubmit');
+const clearLogBtn = document.getElementById('clearLogBtn');
+const importProfileTxtBtn = document.getElementById('importProfileTxtBtn');
 
 // Tab switching
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -42,6 +44,13 @@ scanBtn.addEventListener('click', async () => {
     chrome.tabs.sendMessage(tab.id, { action: 'scanPage' }, async (response) => {
         if (response && response.success) {
             currentFields = response.fields;
+            await chrome.runtime.sendMessage({
+                action: 'updateSession',
+                data: {
+                    fields: response.fields,
+                    currentUrl: tab.url || ''
+                }
+            });
             addSystemMessage(`Found ${response.fields.length} fields`);
             updateContextDisplay('fieldsContext', JSON.stringify(response.fields, null, 2));
 
@@ -65,6 +74,12 @@ async function analyzeFields(fields) {
 
     if (response && response.success) {
         addSystemMessage(`AI generated fill plan for ${response.fillPlan.length} fields`);
+        if (response.debug?.requestContext) {
+            updateContextDisplay('llmRequestContext', JSON.stringify(response.debug.requestContext, null, 2));
+        }
+        if (response.debug?.responseContext) {
+            updateContextDisplay('llmResponseContext', JSON.stringify(response.debug.responseContext, null, 2));
+        }
 
         if (response.missingInfo && response.missingInfo.length > 0) {
             addAssistantMessage(`I need some information:\n${response.missingInfo.join('\n')}`);
@@ -156,21 +171,22 @@ async function sendMessage() {
 
     addUserMessage(message);
     chatInput.value = '';
+    const userEntry = { role: 'user', content: message };
+    chatHistory.push(userEntry);
+    await persistChatHistory();
 
     // Extract user information from message
     await extractAndSaveUserInfo(message);
 
     const response = await chrome.runtime.sendMessage({
         action: 'chat',
-        data: { message, history: chatHistory }
+        data: { message, history: chatHistory.slice(0, -1) }
     });
 
     if (response && response.success) {
         addAssistantMessage(response.response);
-        chatHistory.push(
-            { role: 'user', content: message },
-            { role: 'assistant', content: response.response }
-        );
+        chatHistory.push({ role: 'assistant', content: response.response });
+        await persistChatHistory();
 
         // Also extract from AI response
         await extractAndSaveUserInfo(response.response);
@@ -336,72 +352,69 @@ async function extractAndSaveUserInfo(text) {
     }
 }
 
-// Profile management
-document.getElementById('parseResumeBtn').addEventListener('click', async () => {
-    const fileInput = document.getElementById('resumeUpload');
-    const file = fileInput.files[0];
+if (clearLogBtn) {
+    clearLogBtn.addEventListener('click', () => {
+        logMessages.innerHTML = '';
+    });
+}
 
-    if (!file) {
-        addSystemMessage('Please select a PDF file', 'error');
-        return;
-    }
-
-    addSystemMessage('Parsing resume...');
-
-    try {
-        // Create FormData and send directly to API
-        const formData = new FormData();
-        formData.append('resume', file);
-
-        const response = await fetch('http://localhost:3002/api/parse-resume', {
-            method: 'POST',
-            body: formData
-        });
-
-        if (!response.ok) {
-            throw new Error(`Server error: ${response.statusText}`);
+if (importProfileTxtBtn) {
+    importProfileTxtBtn.addEventListener('click', async () => {
+        const statusNode = document.getElementById('profileImportStatus');
+        importProfileTxtBtn.disabled = true;
+        if (statusNode) {
+            statusNode.textContent = 'Importing profile.txt...';
+            statusNode.className = 'resume-status';
         }
 
-        const result = await response.json();
+        try {
+            const response = await fetch('http://localhost:3002/api/import-profile-text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            if (!response.ok) {
+                throw new Error(`Server error: ${response.statusText}`);
+            }
 
-        if (result.success) {
-            // Save to storage
+            const result = await response.json();
+            if (!result.success) {
+                throw new Error(result.error || 'Import failed');
+            }
+
             const state = await getState();
-            const profile = state.profile || {};
-            profile.resumeText = result.resumeText;
-            profile.resumeMetadata = result.metadata;
+            const mergedProfile = {
+                ...(state.profile || {}),
+                ...(result.profile || {}),
+                importedProfileText: result.profileText || ''
+            };
+            const mergedQaLibrary = {
+                ...(state.qaLibrary || {}),
+                ...(result.qaLibrary || {})
+            };
+            await chrome.storage.local.set({
+                profile: mergedProfile,
+                qaLibrary: mergedQaLibrary
+            });
 
-            await chrome.storage.local.set({ profile });
-
-            addSystemMessage('✓ Resume parsed successfully!');
-            updateContextDisplay('resumeContext', result.resumeText.substring(0, 500) + '...');
-        } else {
-            throw new Error(result.error || 'Parse failed');
+            updateContextDisplay('profileContext', JSON.stringify(mergedProfile, null, 2));
+            addSystemMessage('Profile imported from profile.txt and merged into context.');
+            if (statusNode) {
+                statusNode.textContent = `✓ Imported profile.txt (${result.profileTextLength} chars)`;
+                statusNode.className = 'resume-status success';
+            }
+        } catch (error) {
+            console.error('Profile import error:', error);
+            addSystemMessage(`Profile import failed: ${error.message}`, 'error');
+            if (statusNode) {
+                statusNode.textContent = `Import failed: ${error.message}`;
+                statusNode.className = 'resume-status error';
+            }
+        } finally {
+            importProfileTxtBtn.disabled = false;
         }
-    } catch (error) {
-        console.error('Resume parse error:', error);
-        addSystemMessage(`Resume parsing failed: ${error.message}`, 'error');
-    }
-});
-
-document.getElementById('saveProfileBtn').addEventListener('click', async () => {
-    const profile = {
-        name: document.getElementById('nameInput').value,
-        email: document.getElementById('emailInput').value,
-        phone: document.getElementById('phoneInput').value,
-        location: document.getElementById('locationInput').value
-    };
-
-    const qaLibrary = {
-        sponsorship: document.getElementById('sponsorshipInput').value,
-        startDate: document.getElementById('startDateInput').value,
-        salary: document.getElementById('salaryInput').value
-    };
-
-    await chrome.storage.local.set({ profile, qaLibrary });
-    addSystemMessage('Profile saved!');
-    updateContextDisplay('profileContext', JSON.stringify(profile, null, 2));
-});
+    });
+}
 
 // Utility functions
 function addUserMessage(text) {
@@ -443,13 +456,62 @@ function updateStatus(status) {
 }
 
 function updateContextDisplay(elementId, content) {
-    document.getElementById(elementId).textContent = content;
+    const node = document.getElementById(elementId);
+    if (node) {
+        node.textContent = content;
+    }
 }
 
 async function getState() {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({ action: 'getState' }, resolve);
     });
+}
+
+async function persistChatHistory() {
+    await chrome.storage.local.set({ chatHistory });
+}
+
+function renderChatHistory() {
+    chatMessages.innerHTML = '';
+    for (const entry of chatHistory) {
+        if (entry.role === 'user') {
+            addUserMessage(entry.content);
+        } else if (entry.role === 'assistant') {
+            addAssistantMessage(entry.content);
+        } else if (entry.role === 'system') {
+            addSystemMessage(entry.content);
+        }
+    }
+}
+
+async function loadChatHistory() {
+    const stored = await chrome.storage.local.get('chatHistory');
+    chatHistory = Array.isArray(stored.chatHistory) ? stored.chatHistory : [];
+    renderChatHistory();
+}
+
+async function hydrateContextPanels() {
+    const state = await getState();
+    if (state && state.profile) {
+        updateContextDisplay('profileContext', JSON.stringify(state.profile, null, 2));
+    }
+    if (state?.session?.fields) {
+        updateContextDisplay('fieldsContext', JSON.stringify(state.session.fields, null, 2));
+    }
+    if (state?.session?.lastAnalysis?.requestContext) {
+        updateContextDisplay('llmRequestContext', JSON.stringify(state.session.lastAnalysis.requestContext, null, 2));
+    }
+    if (state?.session?.lastAnalysis?.responseContext) {
+        updateContextDisplay('llmResponseContext', JSON.stringify(state.session.lastAnalysis.responseContext, null, 2));
+    }
+
+    const stored = await chrome.storage.local.get('resumeFile');
+    if (state?.profile?.resumeText) {
+        updateContextDisplay('resumeContext', state.profile.resumeText);
+    } else if (stored?.resumeFile?.text) {
+        updateContextDisplay('resumeContext', stored.resumeFile.text);
+    }
 }
 
 // Listen for notifications from content script
@@ -483,10 +545,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
 // Initialize
 (async () => {
-    const state = await getState();
-    if (state && state.profile) {
-        updateContextDisplay('profileContext', JSON.stringify(state.profile, null, 2));
-    }
-
+    await loadChatHistory();
+    await hydrateContextPanels();
     addSystemMessage('Jobs AI Assistant ready. Click "Scan Page" to begin.');
 })();

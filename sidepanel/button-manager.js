@@ -129,9 +129,22 @@ class ButtonManager {
                 throw new Error('No active tab found');
             }
 
-            // Get fields from session
+            // Get fields from session or auto-scan if missing
             const { session } = await chrome.storage.local.get('session');
-            const fields = session.fields || [];
+            let fields = Array.isArray(session?.fields) ? session.fields : [];
+            if (!fields.length) {
+                this.showMessage('No cached fields. Auto-scanning page...', 'info');
+                const scanResponse = await chrome.tabs.sendMessage(tab.id, { action: 'scanPage' });
+                if (!scanResponse || !scanResponse.success) {
+                    throw new Error('Scan failed, cannot fill without metadata.');
+                }
+                fields = Array.isArray(scanResponse.fields) ? scanResponse.fields : [];
+                if (!fields.length) {
+                    this.showMessage('Scan returned 0 fields. Aborting fill.', 'warn');
+                    this.updateStatus('Error');
+                    return;
+                }
+            }
 
             // Send message to content script
             const response = await chrome.tabs.sendMessage(tab.id, {

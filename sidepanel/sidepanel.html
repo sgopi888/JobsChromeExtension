@@ -69,6 +69,14 @@
           <h3>Form Fields</h3>
           <pre id="fieldsContext" class="context-display">No fields detected</pre>
         </div>
+        <div class="context-section">
+          <h3>LLM Request Context</h3>
+          <pre id="llmRequestContext" class="context-display">No LLM request context yet</pre>
+        </div>
+        <div class="context-section">
+          <h3>LLM Response</h3>
+          <pre id="llmResponseContext" class="context-display">No LLM response yet</pre>
+        </div>
       </div>
 
       <!-- Log Tab -->
@@ -80,8 +88,7 @@
       <!-- Profile Tab -->
       <div id="profileTab" class="tab-pane">
         <div class="profile-form">
-          <!-- Phase 2: Resume Upload Section -->
-          <h3>📄 Resume (Phase 2)</h3>
+          <h3>📄 Resume</h3>
           <div class="resume-upload-section">
             <div class="input-group">
               <input type="text" id="resumePathInput" placeholder="Resume file path or click Browse..." readonly />
@@ -91,67 +98,10 @@
             <button id="autoUploadResumeBtn" class="btn btn-success" disabled>Auto-Upload to Page</button>
             <div id="resumeStatus" class="resume-status">No resume uploaded</div>
           </div>
-          
-          <!-- Legacy Resume Upload (Phase 1) -->
-          <h3>📄 Resume (Legacy)</h3>
-          <input type="file" id="resumeUpload" accept=".pdf" />
-          <button id="parseResumeBtn" class="btn btn-primary">Parse Resume</button>
-          
-          <h3>Basic Info</h3>
-          <input type="text" id="nameInput" placeholder="Full Name" />
-          <input type="email" id="emailInput" placeholder="Email" />
-          <input type="tel" id="phoneInput" placeholder="Phone" />
-          <input type="text" id="locationInput" placeholder="Location" />
-          
-          <!-- Phase 2: Demographics -->
-          <h3>Demographics (Phase 2)</h3>
-          <select id="genderInput">
-            <option value="">Select Gender...</option>
-            <option value="Male">Male</option>
-            <option value="Female">Female</option>
-            <option value="Non-binary">Non-binary</option>
-            <option value="Prefer not to say">Prefer not to say</option>
-          </select>
-          <select id="raceInput">
-            <option value="">Select Race/Ethnicity...</option>
-            <option value="Asian">Asian</option>
-            <option value="White">White</option>
-            <option value="Black or African American">Black or African American</option>
-            <option value="Hispanic or Latino">Hispanic or Latino</option>
-            <option value="Native American">Native American</option>
-            <option value="Pacific Islander">Pacific Islander</option>
-            <option value="Two or more races">Two or more races</option>
-            <option value="Prefer not to say">Prefer not to say</option>
-          </select>
-          <select id="veteranStatusInput">
-            <option value="">Veteran Status...</option>
-            <option value="I am a veteran">I am a veteran</option>
-            <option value="I am not a veteran">I am not a veteran</option>
-            <option value="Prefer not to say">Prefer not to say</option>
-          </select>
-          <select id="disabilityStatusInput">
-            <option value="">Disability Status...</option>
-            <option value="Yes">Yes, I have a disability</option>
-            <option value="No">No, I do not have a disability</option>
-            <option value="Prefer not to say">Prefer not to say</option>
-          </select>
-          
-          <!-- Phase 2: Preferences -->
-          <h3>Preferences (Phase 2)</h3>
-          <input type="text" id="airportInput" placeholder="Nearest Airport (e.g., ATL)" />
-          <input type="text" id="referralSourceInput" placeholder="How did you hear about us?" />
-          <label class="checkbox-label">
-            <input type="checkbox" id="travelInput" />
-            <span>Willing to travel for work</span>
-          </label>
-          
-          <h3>Quick Answers</h3>
-          <input type="text" id="sponsorshipInput" placeholder="Need sponsorship? (Yes/No)" />
-          <input type="text" id="startDateInput" placeholder="Available start date" />
-          <input type="text" id="salaryInput" placeholder="Salary expectation" />
-          <input type="text" id="experienceInput" placeholder="Years of experience" />
-          
-          <button id="saveProfileBtn" class="btn btn-success">Save Profile</button>
+          <h3>Profile Data</h3>
+          <button id="importProfileTxtBtn" class="btn btn-primary">Import from profile.txt</button>
+          <div id="profileImportStatus" class="resume-status">No profile import yet</div>
+          <div class="resume-status">Use Chat tab to add or correct context. It is persisted and reused in LLM calls.</div>
         </div>
       </div>
     </div>

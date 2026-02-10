@@ -13,10 +13,12 @@ async function initializeStorage() {
     const defaults = {
         profile: {},
         qaLibrary: {},
+        chatHistory: [],
         session: {
             status: 'idle',
             currentUrl: '',
             fillPlan: [],
+            fields: [],
             completedFields: [],
             pendingFields: [],
             failedFields: [],
@@ -104,12 +106,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleAnalyzeFields(data, sendResponse) {
     try {
         const { fields } = data;
-        const stored = await chrome.storage.local.get(['profile', 'qaLibrary', 'session']);
+        const stored = await chrome.storage.local.get(['profile', 'qaLibrary', 'session', 'resumeFile', 'chatHistory']);
+        const activeSession = stored.session || { sessionId: generateSessionId() };
+        const resumeText = stored?.profile?.resumeText || stored?.resumeFile?.text || '';
+        const recentChat = Array.isArray(stored.chatHistory) ? stored.chatHistory.slice(-20) : [];
 
         const userContext = {
             profile: stored.profile,
             qaLibrary: stored.qaLibrary,
-            resumeText: stored.profile.resumeText || ''
+            resumeText,
+            chatHistory: recentChat
+        };
+
+        const requestContext = {
+            title: 'LLM REQUEST CONTEXT',
+            fieldsCount: fields.length,
+            fieldTypes: fields.reduce((acc, f) => {
+                acc[f.type] = (acc[f.type] || 0) + 1;
+                return acc;
+            }, {}),
+            profile: userContext.profile || {},
+            qaLibrary: userContext.qaLibrary || {},
+            resumeLength: userContext.resumeText?.length || 0,
+            chatHistoryLength: recentChat.length,
+            chatHistoryPreview: recentChat.slice(-6),
+            sessionId: activeSession.sessionId
         };
 
         // Log full LLM request context
@@ -117,18 +138,7 @@ async function handleAnalyzeFields(data, sendResponse) {
             action: 'displayLog',
             data: {
                 level: 'info',
-                message: JSON.stringify({
-                    title: 'LLM REQUEST CONTEXT',
-                    fieldsCount: fields.length,
-                    fieldTypes: fields.reduce((acc, f) => {
-                        acc[f.type] = (acc[f.type] || 0) + 1;
-                        return acc;
-                    }, {}),
-                    profile: userContext.profile || {},
-                    qaLibrary: userContext.qaLibrary || {},
-                    resumeLength: userContext.resumeText?.length || 0,
-                    sessionId: stored.session.sessionId
-                }, null, 2),
+                message: JSON.stringify(requestContext, null, 2),
                 timestamp: new Date().toISOString(),
                 location: 'service-worker',
                 type: 'detailed'
@@ -141,7 +151,7 @@ async function handleAnalyzeFields(data, sendResponse) {
             body: JSON.stringify({
                 fields,
                 userContext,
-                sessionId: stored.session.sessionId
+                sessionId: activeSession.sessionId
             })
         });
 
@@ -150,20 +160,21 @@ async function handleAnalyzeFields(data, sendResponse) {
         }
 
         const result = await response.json();
+        const responseContext = {
+            title: 'LLM RESPONSE (COMPLETE - NO TRUNCATION)',
+            fillPlan: result.fillPlan || [],
+            fillPlanCount: result.fillPlan?.length || 0,
+            missingInfo: result.missingInfo || [],
+            warnings: result.warnings || [],
+            responseFields: Object.keys(result)
+        };
 
         // Log full LLM response (no truncation)
         chrome.runtime.sendMessage({
             action: 'displayLog',
             data: {
                 level: 'info',
-                message: JSON.stringify({
-                    title: 'LLM RESPONSE (COMPLETE - NO TRUNCATION)',
-                    fillPlan: result.fillPlan || [],
-                    fillPlanCount: result.fillPlan?.length || 0,
-                    missingInfo: result.missingInfo || [],
-                    warnings: result.warnings || [],
-                    responseFields: Object.keys(result)
-                }, null, 2),
+                message: JSON.stringify(responseContext, null, 2),
                 timestamp: new Date().toISOString(),
                 location: 'service-worker',
                 type: 'detailed'
@@ -173,13 +184,26 @@ async function handleAnalyzeFields(data, sendResponse) {
         // Update session with fill plan
         await chrome.storage.local.set({
             session: {
-                ...stored.session,
-                fillPlan: result.fillPlan,
-                status: 'ready'
+                ...activeSession,
+                fillPlan: result.fillPlan || [],
+                fields,
+                status: 'ready',
+                lastAnalysis: {
+                    requestContext,
+                    responseContext,
+                    analyzedAt: new Date().toISOString()
+                }
             }
         });
 
-        sendResponse({ success: true, ...result });
+        sendResponse({
+            success: true,
+            ...result,
+            debug: {
+                requestContext,
+                responseContext
+            }
+        });
     } catch (error) {
         console.error('Analyze fields error:', error);
         sendResponse({ success: false, error: error.message });
@@ -268,7 +292,7 @@ async function handleUpdateSession(data, sendResponse) {
 // Get current state
 async function handleGetState(sendResponse) {
     try {
-        const state = await chrome.storage.local.get(['profile', 'session', 'history', 'settings']);
+        const state = await chrome.storage.local.get(['profile', 'qaLibrary', 'chatHistory', 'session', 'history', 'settings']);
         sendResponse({ success: true, ...state });
     } catch (error) {
         sendResponse({ success: false, error: error.message });

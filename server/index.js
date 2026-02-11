@@ -34,6 +34,7 @@ app.use(express.json({ limit: '50mb' }));
 // In-memory storage for session data
 const sessions = new Map();
 const PROJECT_ROOT = path.resolve(__dirname, '..');
+const SUPPORTED_RESUME_EXTENSIONS = new Set(['.pdf', '.txt', '.rtf', '.doc', '.docx']);
 
 function normalizeText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -50,6 +51,12 @@ function splitFullName(name) {
 }
 
 function inferControlType(field) {
+  const explicitControlType = normalizeText(field.controlType).toLowerCase();
+  const allowedExplicit = new Set(['file', 'checkbox', 'radio', 'menu', 'menu_prompt', 'menu_proxy', 'textarea', 'richtext', 'text']);
+  if (allowedExplicit.has(explicitControlType)) {
+    return explicitControlType === 'menu_proxy' ? 'menu' : explicitControlType;
+  }
+
   const fieldType = (field.type || '').toLowerCase();
   const label = normalizeText(field.label).toLowerCase();
   const placeholder = normalizeText(field.placeholder).toLowerCase();
@@ -89,8 +96,14 @@ function normalizeFieldsForAnalysis(fields) {
       normalizeText(next.label).toLowerCase() === 'select...' &&
       normalizeText(next.id).toLowerCase().startsWith('field_select____');
 
-    if (nextIsSelectProxy && current.controlType === 'text') {
-      current.controlType = 'menu_prompt';
+    if (nextIsSelectProxy && (current.controlType === 'text' || current.controlType === 'menu')) {
+      const currentOptions = Array.isArray(current.options) ? current.options.length : 0;
+      const nextOptions = Array.isArray(next.options) ? next.options.length : 0;
+      if (current.controlType === 'menu' && currentOptions > nextOptions) {
+        next.controlType = 'menu_prompt';
+      } else {
+        current.controlType = 'menu_prompt';
+      }
     }
   }
 
@@ -202,9 +215,147 @@ function inferSelectValue(field, facts) {
   return '';
 }
 
+function normalizeChoice(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function getFieldOptionList(field) {
+  if (!Array.isArray(field.options)) return [];
+
+  const normalized = [];
+  const seen = new Set();
+  for (const option of field.options) {
+    const text = normalizeText(option?.text || option?.label || option?.value);
+    const value = normalizeText(option?.value || option?.text || option?.label);
+    if (!text && !value) continue;
+    const key = `${normalizeChoice(text)}|${normalizeChoice(value)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({ text, value });
+  }
+  return normalized;
+}
+
+function findMenuOptionMatch(field, desiredValue, facts) {
+  const desiredText = normalizeText(desiredValue);
+  if (!desiredText) return '';
+
+  const options = getFieldOptionList(field);
+  if (options.length === 0) {
+    return desiredText;
+  }
+
+  const normalizedDesired = normalizeChoice(desiredText);
+
+  // 1. Exact match
+  const exact = options.find(option =>
+    normalizeChoice(option.text) === normalizedDesired ||
+    normalizeChoice(option.value) === normalizedDesired
+  );
+  if (exact) return exact.text || exact.value;
+
+  // 2. Prefer not to answer patterns (priority over partial match)
+  if (normalizedDesired.includes('prefer not') || normalizedDesired.includes('decline')) {
+    const preferOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.includes('prefer not') || choice.includes('decline') || choice.includes('rather not');
+    });
+    if (preferOpt) return preferOpt.text || preferOpt.value;
+  }
+
+  // 3. Boolean yes/no
+  const booleanMappings = {
+    yes: ['yes', 'authorized', 'i am', 'true', 'have'],
+    no: ['no', 'not', 'false', 'do not', 'don t']
+  };
+  if (booleanMappings.yes.some(keyword => normalizedDesired.includes(keyword))) {
+    const yesOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.startsWith('yes') || choice.includes('authorized') || choice.includes('i am');
+    });
+    if (yesOpt) return yesOpt.text || yesOpt.value;
+  }
+  if (booleanMappings.no.some(keyword => normalizedDesired.includes(keyword))) {
+    const noOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.startsWith('no') || choice.includes('not');
+    });
+    if (noOpt) return noOpt.text || noOpt.value;
+  }
+
+  // 4. Gender identity patterns
+  if (normalizedDesired.includes('male') && !normalizedDesired.includes('female')) {
+    const maleOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice === 'male' || choice === 'man' || choice === 'cis male' || choice === 'cisgender male';
+    });
+    if (maleOpt) return maleOpt.text || maleOpt.value;
+  }
+  if (normalizedDesired.includes('female')) {
+    const femaleOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice === 'female' || choice === 'woman' || choice === 'cis female' || choice === 'cisgender female';
+    });
+    if (femaleOpt) return femaleOpt.text || femaleOpt.value;
+  }
+
+  // 5. Veteran status patterns
+  if (normalizedDesired.includes('not a protected veteran') || normalizedDesired.includes('i am not')) {
+    const notVetOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.includes('i am not') || choice.includes('not a protected');
+    });
+    if (notVetOpt) return notVetOpt.text || notVetOpt.value;
+  }
+
+  // 6. Country patterns
+  if (normalizedDesired.includes('united states') || normalizedDesired === 'usa' || normalizedDesired === 'us') {
+    const countryOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.includes('united states') || choice === 'usa' || choice === 'us' || choice.startsWith('united states');
+    });
+    if (countryOpt) return countryOpt.text || countryOpt.value;
+  }
+
+  // 7. Referral source patterns
+  if (normalizedDesired.includes('linkedin') || normalizedDesired.includes('professional network')) {
+    const referralOpt = options.find(option => {
+      const choice = normalizeChoice(option.text);
+      return choice.includes('linkedin') || choice.includes('professional network');
+    });
+    if (referralOpt) return referralOpt.text || referralOpt.value;
+  }
+
+  // 8. Partial contains match
+  const contains = options.find(option =>
+    normalizeChoice(option.text).includes(normalizedDesired) ||
+    normalizeChoice(option.value).includes(normalizedDesired) ||
+    normalizedDesired.includes(normalizeChoice(option.text))
+  );
+  if (contains) return contains.text || contains.value;
+
+  // 9. Fallback inference (only if not already in recursive call)
+  if (!facts?.__skipInferFallback) {
+    const fallbackDesired = inferSelectValue(field, facts);
+    if (fallbackDesired && normalizeChoice(fallbackDesired) !== normalizedDesired) {
+      const fallbackMatch = findMenuOptionMatch(field, fallbackDesired, { ...facts, __skipInferFallback: true });
+      if (fallbackMatch) return fallbackMatch;
+    }
+  }
+
+  console.warn(`[Server] No match found for "${desiredValue}" among ${options.length} options in field "${field.label || field.id}"`);
+  return '';
+}
+
 function inferFieldValue(field, facts) {
   if (field.controlType === 'menu_prompt') return '';
-  if (field.controlType === 'menu') return inferSelectValue(field, facts);
+  if (field.controlType === 'menu') {
+    const inferred = inferSelectValue(field, facts);
+    return findMenuOptionMatch(field, inferred, facts);
+  }
   if (field.controlType === 'checkbox' || field.controlType === 'radio') return true;
   if (field.controlType === 'textarea' || field.controlType === 'text') return inferTextValue(field, facts);
   return '';
@@ -247,6 +398,16 @@ function sanitizeAndBackfillFillPlan(rawPlan, fields, userContext) {
     let value = item.value;
     if ((value === undefined || value === null || value === '') && action !== 'skip' && action !== 'upload') {
       value = inferFieldValue(field, facts);
+    }
+    if (field.controlType === 'menu' && action === 'select') {
+      const matchedValue = findMenuOptionMatch(field, value, facts);
+      if (matchedValue) {
+        value = matchedValue;
+      } else if (Array.isArray(field.options) && field.options.length > 0) {
+        warnings.push(`No valid option match for field: ${field.label || field.id}`);
+        action = 'skip';
+        value = '';
+      }
     }
     if (action === 'check') {
       value = value === undefined || value === null || value === '' ? true : value;
@@ -311,6 +472,83 @@ function heuristicProfileParse(text) {
   return { profile, qaLibrary };
 }
 
+function getMimeTypeFromExtension(ext) {
+  const normalized = ext.toLowerCase();
+  if (normalized === '.pdf') return 'application/pdf';
+  if (normalized === '.txt') return 'text/plain';
+  if (normalized === '.rtf') return 'application/rtf';
+  if (normalized === '.doc') return 'application/msword';
+  if (normalized === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  return 'application/octet-stream';
+}
+
+async function extractResumeTextFromBuffer(filePath, ext, fileBuffer) {
+  const normalized = ext.toLowerCase();
+  if (normalized === '.pdf') {
+    const parsed = await pdfParse(fileBuffer);
+    return {
+      resumeText: parsed.text || '',
+      pages: parsed.numpages || 0
+    };
+  }
+
+  if (normalized === '.txt' || normalized === '.rtf') {
+    return {
+      resumeText: fileBuffer.toString('utf-8'),
+      pages: 0
+    };
+  }
+
+  // DOC/DOCX text parsing is intentionally skipped to avoid fragile dependencies.
+  return {
+    resumeText: '',
+    pages: 0
+  };
+}
+
+async function loadDefaultResumeFromDirectory(directoryPath) {
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+  const fileCandidates = entries
+    .filter(entry => entry.isFile())
+    .map(entry => {
+      const ext = path.extname(entry.name).toLowerCase();
+      return { name: entry.name, ext };
+    })
+    .filter(entry => SUPPORTED_RESUME_EXTENSIONS.has(entry.ext));
+
+  if (fileCandidates.length === 0) {
+    throw new Error(`No resume files found in ${directoryPath}`);
+  }
+
+  const enriched = await Promise.all(fileCandidates.map(async entry => {
+    const fullPath = path.join(directoryPath, entry.name);
+    const stat = await fs.stat(fullPath);
+    return { ...entry, fullPath, modifiedTime: stat.mtimeMs };
+  }));
+
+  enriched.sort((a, b) => b.modifiedTime - a.modifiedTime);
+  const selected = enriched[0];
+
+  const fileBuffer = await fs.readFile(selected.fullPath);
+  const parsed = await extractResumeTextFromBuffer(selected.fullPath, selected.ext, fileBuffer);
+  const mimeType = getMimeTypeFromExtension(selected.ext);
+  const dataUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+
+  return {
+    name: selected.name,
+    type: mimeType,
+    data: dataUrl,
+    text: parsed.resumeText || '',
+    metadata: {
+      pages: parsed.pages || 0,
+      filename: selected.name,
+      loadedFrom: selected.fullPath,
+      loadedAt: new Date().toISOString()
+    },
+    uploadedAt: new Date().toISOString()
+  };
+}
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', model: process.env.OPENAI_MODEL || 'gpt-4o-mini' });
@@ -346,6 +584,25 @@ app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
   } catch (error) {
     console.error('❌ Resume parsing error:', error);
     res.status(500).json({ error: 'Failed to parse resume', details: error.message });
+  }
+});
+
+app.post('/api/load-default-resume', async (req, res) => {
+  try {
+    const requestedPath = normalizeText(req.body?.path || '');
+    const resumeDir = requestedPath
+      ? (path.isAbsolute(requestedPath) ? requestedPath : path.join(PROJECT_ROOT, requestedPath))
+      : path.join(PROJECT_ROOT, 'resume');
+
+    const resumeFile = await loadDefaultResumeFromDirectory(resumeDir);
+
+    res.json({
+      success: true,
+      resumeFile
+    });
+  } catch (error) {
+    console.error('❌ Default resume load error:', error);
+    res.status(500).json({ error: 'Failed to load default resume', details: error.message });
   }
 });
 

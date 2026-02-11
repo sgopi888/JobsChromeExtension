@@ -52,6 +52,10 @@ if (!window.__JOBS_AI_LISTENER_ATTACHED__) {
 // Scan page for form fields
 async function handleScanPage(sendResponse) {
     try {
+        // Reset filled fields tracker on new scan
+        resetFilledFieldsTracker();
+        console.log('[ContentScript] Reset filled fields tracker on new page scan');
+
         const fields = await detectFormFields();
         sendResponse({ success: true, fields });
     } catch (error) {
@@ -63,26 +67,32 @@ async function handleScanPage(sendResponse) {
 // Detect all form fields on the page
 async function detectFormFields() {
     const fields = [];
-    const formElements = document.querySelectorAll('input, select, textarea');
+    const formElements = getFormElements();
 
     console.log(`[DEBUG] Found ${formElements.length} form elements on page`);
 
     for (const element of formElements) {
-        // Skip hidden, disabled, or readonly fields
-        if (element.type === 'hidden' || element.disabled || element.readOnly) {
+        const tag = element.tagName.toLowerCase();
+        const inputType = (element.type || '').toLowerCase();
+
+        // Skip disabled or readonly fields
+        if (element.disabled || element.readOnly) {
             continue;
         }
 
-        // Skip submit buttons
-        if (element.type === 'submit' || element.type === 'button') {
+        // Skip hidden and button-like fields
+        if (inputType === 'hidden' || inputType === 'submit' || inputType === 'button' || inputType === 'image' || inputType === 'reset') {
+            continue;
+        }
+
+        // Keep hidden file inputs (often intentionally hidden by styled upload controls)
+        if (inputType !== 'file' && !isVisibleElement(element)) {
             continue;
         }
 
         const generatedId = element.id || generateFieldId(element);
         const controlType = detectControlType(element);
-        const normalizedType = controlType === 'menu'
-            ? 'select'
-            : (element.type || element.tagName.toLowerCase());
+        const normalizedType = normalizeFieldType(element, controlType);
         
         const field = {
             id: generatedId,
@@ -92,36 +102,42 @@ async function detectFormFields() {
             label: getFieldLabel(element),
             placeholder: element.placeholder || '',
             required: element.required || element.hasAttribute('aria-required'),
-            value: element.value || '',
+            value: getElementValue(element),
             options: [],
             // Store original attributes for reliable lookup
             originalId: element.id || null,
-            selector: generateSelector(element)
+            selector: generateSelector(element),
+            controlSelector: generateSelector(resolvePrimaryControl(element)),
+            containerSelector: generateContainerSelector(element),
+            ariaControls: element.getAttribute('aria-controls') || '',
+            role: element.getAttribute('role') || ''
         };
 
         console.log(`[DEBUG] Scanned field: id="${field.id}", originalId="${field.originalId}", name="${field.name}", selector="${field.selector}"`);
 
         // For select elements, get all options
-        if (element.tagName === 'SELECT') {
+        if (tag === 'select') {
             field.options = Array.from(element.options).map(opt => ({
                 value: opt.value,
                 text: opt.text
             }));
         }
 
-        // For custom menu controls, collect visible options if present in DOM
+        // For custom menu controls, collect options by opening dropdown/listbox if needed
         if (controlType === 'menu' && field.options.length === 0) {
-            field.options = extractMenuOptions(element);
+            field.options = await extractMenuOptions(element);
         }
 
         // For radio buttons, get all options in the group
-        if (element.type === 'radio') {
+        if (inputType === 'radio') {
             const radioGroup = document.querySelectorAll(`input[name="${element.name}"]`);
             field.options = Array.from(radioGroup).map(radio => ({
                 value: radio.value,
                 label: getFieldLabel(radio)
             }));
         }
+
+        field.semanticHint = inferSemanticHint(field);
 
         console.log(`[DEBUG] Field controlType="${field.controlType}", type="${field.type}", options=${field.options.length}`);
         fields.push(field);
@@ -151,6 +167,26 @@ async function detectFormFields() {
     return fields;
 }
 
+function getFormElements() {
+    const selector = [
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"])',
+        'select',
+        'textarea',
+        '[contenteditable="true"]',
+        '[role="textbox"]',
+        '[role="combobox"]'
+    ].join(', ');
+
+    const seen = new Set();
+    const elements = [];
+    document.querySelectorAll(selector).forEach(element => {
+        if (seen.has(element)) return;
+        seen.add(element);
+        elements.push(element);
+    });
+    return elements;
+}
+
 function detectControlType(element) {
     if (!element) return 'text';
 
@@ -158,47 +194,201 @@ function detectControlType(element) {
     const type = (element.type || '').toLowerCase();
     const role = (element.getAttribute('role') || '').toLowerCase();
     const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
+    const ariaControls = (element.getAttribute('aria-controls') || '').toLowerCase();
     const placeholder = (element.placeholder || '').toLowerCase();
     const id = (element.id || '').toLowerCase();
+    const className = (element.className || '').toString().toLowerCase();
+    const inputMode = (element.getAttribute('inputmode') || '').toLowerCase();
 
     if (tag === 'select') return 'menu';
     if (type === 'checkbox') return 'checkbox';
     if (type === 'radio') return 'radio';
     if (tag === 'textarea') return 'textarea';
+    if (element.isContentEditable) return 'richtext';
+    if (role === 'textbox' && tag !== 'input' && tag !== 'textarea') return 'richtext';
 
     const isCustomMenu = role === 'combobox' ||
         ariaHaspopup === 'listbox' ||
+        ariaControls.includes('listbox') ||
         id.startsWith('field_select____') ||
         placeholder === 'select...' ||
-        element.closest('[role="combobox"], [aria-haspopup="listbox"], [data-testid*="select"]');
+        inputMode === 'search' ||
+        className.includes('select__control') ||
+        className.includes('react-select') ||
+        element.closest('[role="combobox"], [aria-haspopup="listbox"], [data-testid*="select"], [class*="select__control"], [class*="react-select"]');
 
     if (isCustomMenu) return 'menu';
 
     return 'text';
 }
 
-function extractMenuOptions(element) {
+function normalizeFieldType(element, controlType) {
+    const tag = element.tagName.toLowerCase();
+    const type = (element.type || '').toLowerCase();
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    const inputMode = (element.getAttribute('inputmode') || '').toLowerCase();
+
+    if (controlType === 'menu') return 'select';
+    if (controlType === 'checkbox') return 'checkbox';
+    if (controlType === 'radio') return 'radio';
+    if (controlType === 'textarea') return 'textarea';
+    if (controlType === 'richtext') return 'richtext';
+
+    if (tag === 'textarea') return 'textarea';
+    if (element.isContentEditable) return 'richtext';
+    if (role === 'textbox' && tag !== 'input' && tag !== 'textarea') return 'richtext';
+    if (type === 'url' || inputMode === 'url') return 'url';
+    if (type === 'email') return 'email';
+    if (type === 'tel') return 'tel';
+    if (type === 'number') return 'number';
+    if (type === 'date') return 'date';
+
+    return type || tag || 'text';
+}
+
+function getElementValue(element) {
+    if (!element) return '';
+    if (element.isContentEditable) {
+        return element.innerText || '';
+    }
+    return typeof element.value === 'string' ? element.value : '';
+}
+
+function inferSemanticHint(field) {
+    const txt = `${field.label || ''} ${field.placeholder || ''} ${field.name || ''}`.toLowerCase();
+
+    if (/\b(linkedin|github|portfolio|website|url|link)\b/.test(txt)) return 'url';
+    if (/\b(short note|why|describe|project|cover letter|about you|motivation)\b/.test(txt)) return 'short_note';
+    if (/\b(email)\b/.test(txt)) return 'email';
+    if (/\b(phone|mobile|contact number)\b/.test(txt)) return 'phone';
+    if (/\b(country|citizenship|work authorization|sponsorship|veteran|gender|race|ethnicity|disability)\b/.test(txt)) return 'demographic';
+
+    return 'general_text';
+}
+
+async function extractMenuOptions(element) {
     const options = [];
-    const addOption = (value, text) => {
+    const addOption = (value, text, source = 'dom') => {
         if (!text) return;
-        if (options.some(opt => opt.text === text)) return;
-        options.push({ value: value || text, text });
+        const normalized = normalizeOptionText(text);
+        if (!normalized) return;
+        if (options.some(opt => normalizeOptionText(opt.text) === normalized)) return;
+        options.push({ value: value || text, text, source });
     };
 
-    const listboxId = element.getAttribute('aria-controls');
-    const scopedRoot = listboxId ? document.getElementById(listboxId) : null;
-    const questionRoot = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question');
-    const scanRoot = scopedRoot || questionRoot || element.parentElement || document;
-    const optionNodes = Array.from(scanRoot.querySelectorAll('[role="option"], [role="menuitem"], option'))
-        .filter(node => node.tagName === 'OPTION' || isVisibleElement(node));
+    // 1) Native select options
+    if (element.tagName === 'SELECT') {
+        Array.from(element.options).forEach(opt => {
+            addOption(opt.value, (opt.textContent || '').replace(/\s+/g, ' ').trim(), 'native-select');
+        });
+        if (options.length > 0) return options;
+    }
 
+    // 2) Existing visible options near element (if already open/rendered)
+    const optionNodes = collectOptionNodes(element, false);
     for (const node of optionNodes) {
         const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!text) continue;
-        addOption(node.value, text);
+        addOption(node.value, text, 'visible-dom');
+    }
+    if (options.length > 0) return options;
+
+    // 3) Try opening menu and extracting rendered listbox options
+    const openedOptionNodes = await openMenuAndCollectOptionNodes(element);
+    for (const node of openedOptionNodes) {
+        const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        addOption(node.value, text, 'opened-listbox');
     }
 
     return options;
+}
+
+function collectOptionNodes(element, visibleOnly = true) {
+    const selectors = '[role="option"], [role="menuitem"], [role="menuitemradio"], option, li[role="option"]';
+    const listboxRoot = findListboxRoot(element);
+    const questionRoot = getQuestionRoot(element);
+    const scanRoots = [listboxRoot, questionRoot, element.parentElement, document].filter(Boolean);
+
+    for (const root of scanRoots) {
+        const nodes = Array.from(root.querySelectorAll(selectors))
+            .filter(node => !visibleOnly || node.tagName === 'OPTION' || isVisibleElement(node));
+        if (nodes.length > 0) {
+            return nodes;
+        }
+    }
+
+    return [];
+}
+
+async function openMenuAndCollectOptionNodes(element) {
+    const trigger = resolvePrimaryControl(element);
+    if (!trigger) return [];
+
+    const preOpenNodes = collectOptionNodes(trigger, true);
+    if (preOpenNodes.length > 0) return preOpenNodes;
+
+    try {
+        trigger.focus();
+        trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        trigger.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        trigger.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowDown' }));
+        await waitMs(180);
+
+        const openNodes = collectOptionNodes(trigger, true);
+        return openNodes;
+    } catch (error) {
+        console.warn('[DEBUG] Failed opening menu for option scan:', error);
+        return [];
+    } finally {
+        try {
+            trigger.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+            trigger.blur();
+        } catch (error) {
+            // ignore close errors
+        }
+    }
+}
+
+function getQuestionRoot(element) {
+    return element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question, [data-qa*="question"]');
+}
+
+function findListboxRoot(element) {
+    const listboxId = element.getAttribute('aria-controls');
+    if (listboxId) {
+        const byId = document.getElementById(listboxId);
+        if (byId) return byId;
+    }
+
+    const trigger = resolvePrimaryControl(element);
+    const triggerListboxId = trigger?.getAttribute('aria-controls');
+    if (triggerListboxId) {
+        const byTriggerId = document.getElementById(triggerListboxId);
+        if (byTriggerId) return byTriggerId;
+    }
+
+    const questionRoot = getQuestionRoot(element);
+    if (questionRoot) {
+        const inQuestion = questionRoot.querySelector('[role="listbox"], [id*="listbox"]');
+        if (inQuestion) return inQuestion;
+    }
+
+    const visibleGlobal = Array.from(document.querySelectorAll('[role="listbox"], [id*="listbox"], .select__menu, .react-select__menu'))
+        .find(isVisibleElement);
+    return visibleGlobal || null;
+}
+
+function resolvePrimaryControl(element) {
+    if (!element) return null;
+    if (isMenuLikeElement(element)) return element;
+
+    const questionRoot = getQuestionRoot(element);
+    if (questionRoot) {
+        const preferred = questionRoot.querySelector('[role="combobox"], [aria-haspopup="listbox"], select, input[id^="field_select____"]');
+        if (preferred) return preferred;
+    }
+
+    return element;
 }
 
 // Get label for a field
@@ -225,6 +415,16 @@ function getFieldLabel(element) {
         return element.placeholder;
     }
 
+    // Try question container heading/label text
+    const questionRoot = getQuestionRoot(element);
+    if (questionRoot) {
+        const promptNode = questionRoot.querySelector('legend, label, [class*="label"], [data-testid*="label"], h3, h4');
+        const promptText = promptNode ? promptNode.textContent.trim() : '';
+        if (promptText && normalizeOptionText(promptText) !== 'select...') {
+            return promptText;
+        }
+    }
+
     // Try previous sibling text
     let prev = element.previousElementSibling;
     while (prev) {
@@ -246,6 +446,8 @@ function generateFieldId(element) {
 
 // Generate a CSS selector for an element
 function generateSelector(element) {
+    if (!element) return '';
+
     // If element has an ID, use it
     if (element.id) {
         return `#${element.id}`;
@@ -280,6 +482,16 @@ function generateSelector(element) {
     return selector;
 }
 
+function generateContainerSelector(element) {
+    const container = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question');
+    if (!container) return '';
+    return generateSelector(container);
+}
+
+function waitMs(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // Start filling form with AI-generated plan
 async function handleStartFilling(data, sendResponse) {
     if (isProcessing) {
@@ -312,6 +524,24 @@ async function handleStartFilling(data, sendResponse) {
 }
 
 // Execute the fill plan
+// Track filled fields to prevent duplicate fills (session-scoped)
+const filledFieldsTracker = new Map();
+
+function resetFilledFieldsTracker() {
+    filledFieldsTracker.clear();
+}
+
+function markFieldAsFilled(fieldId, value) {
+    filledFieldsTracker.set(fieldId, { value, timestamp: Date.now() });
+}
+
+function isFieldAlreadyFilled(fieldId, value) {
+    const record = filledFieldsTracker.get(fieldId);
+    if (!record) return false;
+    // Allow re-fill if value is different
+    return record.value === value;
+}
+
 async function executeFillPlan(fillPlan) {
     for (let i = 0; i < fillPlan.length; i++) {
         // Check for pause
@@ -332,10 +562,20 @@ async function executeFillPlan(fillPlan) {
 
         const item = fillPlan[i];
 
+        // Skip if already filled with same value
+        if (isFieldAlreadyFilled(item.fieldId, item.value)) {
+            console.log(`[ContentScript] Skipping already-filled field: ${item.fieldId}`);
+            notifySidePanel({ type: 'skipped', field: item.fieldId, reason: 'already_filled' });
+            continue;
+        }
+
         try {
             notifySidePanel({ type: 'filling', field: item.fieldId, action: item.action });
 
             await fillField(item);
+
+            // Mark as filled
+            markFieldAsFilled(item.fieldId, item.value);
 
             // Log success
             logAction({
@@ -381,7 +621,11 @@ async function fillField(item) {
 
     switch (item.action) {
         case 'type':
-            await humanLikeType(element, item.value);
+            if (element.isContentEditable || ((element.getAttribute('role') || '').toLowerCase() === 'textbox' && element.tagName !== 'INPUT' && element.tagName !== 'TEXTAREA')) {
+                await fillRichText(element, item.value);
+            } else {
+                await humanLikeType(element, item.value);
+            }
             break;
 
         case 'select':
@@ -390,6 +634,10 @@ async function fillField(item) {
 
         case 'check':
             await checkBox(element, item);
+            break;
+
+        case 'radio':
+            await checkBox(element, { ...item, action: 'check' });
             break;
 
         case 'upload':
@@ -426,6 +674,22 @@ async function humanLikeType(element, text) {
     element.dispatchEvent(new Event('change', { bubbles: true }));
     element.blur();
     await randomDelay(100, 200);
+}
+
+async function fillRichText(element, text) {
+    element.focus();
+    await randomDelay(80, 140);
+
+    element.innerText = '';
+    element.dispatchEvent(new InputEvent('input', { bubbles: true }));
+
+    const content = String(text || '');
+    element.innerText = content;
+    element.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+
+    element.blur();
+    await randomDelay(80, 140);
 }
 
 // Select option from dropdown - CLICK-BASED APPROACH
@@ -649,6 +913,39 @@ function findElement(fieldId, action = '') {
     
     if (fieldData) {
         console.log(`[DEBUG] Found metadata: originalId="${fieldData.originalId}", name="${fieldData.name}", selector="${fieldData.selector}"`);
+
+        if (isMenuAction && fieldData.controlSelector) {
+            try {
+                const controlElement = document.querySelector(fieldData.controlSelector);
+                if (controlElement) {
+                    const menuElement = resolveAssociatedMenuElement(controlElement);
+                    if (menuElement) {
+                        console.log(`[DEBUG] Found menu element by controlSelector: ${fieldData.controlSelector}`);
+                        return menuElement;
+                    }
+                }
+            } catch (error) {
+                console.warn(`[DEBUG] Invalid controlSelector: ${fieldData.controlSelector}`, error);
+            }
+        }
+
+        if (isMenuAction && fieldData.containerSelector) {
+            try {
+                const container = document.querySelector(fieldData.containerSelector);
+                if (container) {
+                    const containerMenu = container.querySelector('[role="combobox"], [aria-haspopup="listbox"], select, input[id^="field_select____"]');
+                    if (containerMenu) {
+                        const menuElement = resolveAssociatedMenuElement(containerMenu);
+                        if (menuElement) {
+                            console.log(`[DEBUG] Found menu element by containerSelector: ${fieldData.containerSelector}`);
+                            return menuElement;
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn(`[DEBUG] Invalid containerSelector: ${fieldData.containerSelector}`, error);
+            }
+        }
         
         // Try original ID first
         if (fieldData.originalId) {
@@ -770,12 +1067,15 @@ function resolveAssociatedMenuElement(element) {
     if (!element) return null;
     if (isMenuLikeElement(element)) return element;
 
-    const questionRoot = element.closest('fieldset, [class*="question"], [data-testid*="question"], .application-question') ||
-        element.closest('label, div') ||
-        document;
+    const primary = resolvePrimaryControl(element);
+    if (primary && isMenuLikeElement(primary)) {
+        return primary;
+    }
+
+    const questionRoot = getQuestionRoot(element) || element.closest('label, div') || document;
 
     const candidates = Array.from(questionRoot.querySelectorAll(
-        '[role="combobox"], [aria-haspopup="listbox"], button[aria-haspopup="listbox"], select, [id^="field_select____"]'
+        '[role="combobox"], [aria-haspopup="listbox"], button[aria-haspopup="listbox"], select, [id^="field_select____"], [role="textbox"]'
     ));
 
     const visibleCandidate = candidates.find(node => isMenuLikeElement(node));
@@ -788,9 +1088,16 @@ function isMenuLikeElement(element) {
 
     const role = (element.getAttribute('role') || '').toLowerCase();
     const ariaHasPopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
+    const ariaControls = (element.getAttribute('aria-controls') || '').toLowerCase();
+    const placeholder = (element.getAttribute('placeholder') || '').toLowerCase();
     const id = (element.id || '').toLowerCase();
+    const className = (element.className || '').toString().toLowerCase();
     return role === 'combobox' ||
         ariaHasPopup === 'listbox' ||
+        ariaControls.includes('listbox') ||
+        placeholder === 'select...' ||
+        className.includes('select__control') ||
+        className.includes('react-select') ||
         id.startsWith('field_select____');
 }
 

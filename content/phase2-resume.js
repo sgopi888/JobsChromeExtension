@@ -40,8 +40,16 @@ async function uploadStoredResume(fileInput) {
         fileInput.dispatchEvent(new Event('change', { bubbles: true }));
         fileInput.dispatchEvent(new Event('input', { bubbles: true }));
         
+        const uploadedName = fileInput?.files?.[0]?.name || '';
+        if (!uploadedName) {
+            throw new Error('Resume upload did not attach a file to the target input');
+        }
+
         console.log('[Phase2-Resume] ✓ Resume uploaded successfully');
-        return true;
+        return {
+            success: true,
+            fileName: uploadedName
+        };
         
     } catch (error) {
         console.error('[Phase2-Resume] Error uploading resume:', error);
@@ -109,17 +117,7 @@ async function autoUploadResumeToPage() {
         }
         
         // Try to find the resume input specifically
-        let resumeInput = null;
-        for (const input of fileInputs) {
-            const label = getFieldLabel(input);
-            if (label.toLowerCase().includes('resume') || 
-                label.toLowerCase().includes('cv') ||
-                input.name.toLowerCase().includes('resume') ||
-                input.name.toLowerCase().includes('cv')) {
-                resumeInput = input;
-                break;
-            }
-        }
+        let resumeInput = findBestResumeInput(fileInputs);
         
         // If not found, use first file input
         if (!resumeInput) {
@@ -130,7 +128,8 @@ async function autoUploadResumeToPage() {
         console.log('[Phase2-Resume] Found resume input:', resumeInput);
         
         // Upload resume
-        await uploadStoredResume(resumeInput);
+        const uploadResult = await uploadStoredResume(resumeInput);
+        verifyUploadedFile(resumeInput, uploadResult.fileName);
         
         // Wait for website to auto-fill fields (3 seconds)
         console.log('[Phase2-Resume] Waiting 3 seconds for website to auto-fill...');
@@ -151,7 +150,8 @@ async function autoUploadResumeToPage() {
         console.log('[Phase2-Resume] ✓ Auto-upload process complete');
         return {
             success: true,
-            clearedFields: clearedCount
+            clearedFields: clearedCount,
+            uploadedFile: uploadResult.fileName
         };
         
     } catch (error) {
@@ -168,6 +168,52 @@ async function autoUploadResumeToPage() {
         
         throw error;
     }
+}
+
+function findBestResumeInput(fileInputs) {
+    const candidates = Array.from(fileInputs || []);
+    if (candidates.length === 0) return null;
+
+    const scored = candidates
+        .map(input => {
+            const label = getFieldLabel(input).toLowerCase();
+            const id = (input.id || '').toLowerCase();
+            const name = (input.name || '').toLowerCase();
+            const accept = (input.accept || '').toLowerCase();
+            const hints = `${label} ${id} ${name}`;
+
+            let score = 0;
+            if (hints.includes('resume')) score += 6;
+            if (hints.includes('cv')) score += 5;
+            if (hints.includes('cover')) score -= 4;
+            if (accept.includes('.pdf') || accept.includes('application/pdf')) score += 2;
+            if (isElementVisible(input)) score += 1;
+            return { input, score };
+        })
+        .sort((a, b) => b.score - a.score);
+
+    return scored[0]?.input || null;
+}
+
+function verifyUploadedFile(fileInput, expectedFileName) {
+    const attachedName = fileInput?.files?.[0]?.name || '';
+    if (!attachedName) {
+        throw new Error('File input still empty after upload');
+    }
+    if (expectedFileName && attachedName !== expectedFileName) {
+        console.warn(`[Phase2-Resume] Uploaded filename mismatch: expected="${expectedFileName}" actual="${attachedName}"`);
+    }
+}
+
+function isElementVisible(element) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        parseFloat(style.opacity || '1') > 0;
 }
 
 /**

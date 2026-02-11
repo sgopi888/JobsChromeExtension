@@ -358,61 +358,86 @@ if (clearLogBtn) {
     });
 }
 
-if (importProfileTxtBtn) {
-    importProfileTxtBtn.addEventListener('click', async () => {
-        const statusNode = document.getElementById('profileImportStatus');
+async function importProfileTxt({ silent = false } = {}) {
+    const statusNode = document.getElementById('profileImportStatus');
+    if (importProfileTxtBtn) {
         importProfileTxtBtn.disabled = true;
-        if (statusNode) {
-            statusNode.textContent = 'Importing profile.txt...';
-            statusNode.className = 'resume-status';
+    }
+    if (statusNode) {
+        statusNode.textContent = 'Importing profile.txt...';
+        statusNode.className = 'resume-status';
+    }
+
+    try {
+        const response = await fetch('http://localhost:3002/api/import-profile-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        if (!response.ok) {
+            throw new Error(`Server error: ${response.statusText}`);
         }
 
-        try {
-            const response = await fetch('http://localhost:3002/api/import-profile-text', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({})
-            });
-            if (!response.ok) {
-                throw new Error(`Server error: ${response.statusText}`);
-            }
+        const result = await response.json();
+        if (!result.success) {
+            throw new Error(result.error || 'Import failed');
+        }
 
-            const result = await response.json();
-            if (!result.success) {
-                throw new Error(result.error || 'Import failed');
-            }
+        const state = await getState();
+        const mergedProfile = {
+            ...(state.profile || {}),
+            ...(result.profile || {}),
+            importedProfileText: result.profileText || ''
+        };
+        const mergedQaLibrary = {
+            ...(state.qaLibrary || {}),
+            ...(result.qaLibrary || {})
+        };
+        await chrome.storage.local.set({
+            profile: mergedProfile,
+            qaLibrary: mergedQaLibrary,
+            profileTxtAutoImportedAt: new Date().toISOString()
+        });
 
-            const state = await getState();
-            const mergedProfile = {
-                ...(state.profile || {}),
-                ...(result.profile || {}),
-                importedProfileText: result.profileText || ''
-            };
-            const mergedQaLibrary = {
-                ...(state.qaLibrary || {}),
-                ...(result.qaLibrary || {})
-            };
-            await chrome.storage.local.set({
-                profile: mergedProfile,
-                qaLibrary: mergedQaLibrary
-            });
-
-            updateContextDisplay('profileContext', JSON.stringify(mergedProfile, null, 2));
+        updateContextDisplay('profileContext', JSON.stringify(mergedProfile, null, 2));
+        if (!silent) {
             addSystemMessage('Profile imported from profile.txt and merged into context.');
-            if (statusNode) {
-                statusNode.textContent = `✓ Imported profile.txt (${result.profileTextLength} chars)`;
-                statusNode.className = 'resume-status success';
-            }
-        } catch (error) {
-            console.error('Profile import error:', error);
+        }
+        if (statusNode) {
+            statusNode.textContent = `✓ Imported profile.txt (${result.profileTextLength} chars)`;
+            statusNode.className = 'resume-status success';
+        }
+        return true;
+    } catch (error) {
+        console.error('Profile import error:', error);
+        if (!silent) {
             addSystemMessage(`Profile import failed: ${error.message}`, 'error');
-            if (statusNode) {
-                statusNode.textContent = `Import failed: ${error.message}`;
-                statusNode.className = 'resume-status error';
-            }
-        } finally {
+        }
+        if (statusNode) {
+            statusNode.textContent = `Import failed: ${error.message}`;
+            statusNode.className = 'resume-status error';
+        }
+        return false;
+    } finally {
+        if (importProfileTxtBtn) {
             importProfileTxtBtn.disabled = false;
         }
+    }
+}
+
+function shouldAutoImportProfile(profile = {}) {
+    if (!profile || Object.keys(profile).length === 0) {
+        return true;
+    }
+    if (!profile.importedProfileText) {
+        return true;
+    }
+    return false;
+}
+
+if (importProfileTxtBtn) {
+    importProfileTxtBtn.addEventListener('click', async () => {
+        await importProfileTxt({ silent: false });
     });
 }
 
@@ -546,6 +571,10 @@ chrome.runtime.onMessage.addListener((message) => {
 // Initialize
 (async () => {
     await loadChatHistory();
+    const storedProfile = await chrome.storage.local.get('profile');
+    if (shouldAutoImportProfile(storedProfile.profile)) {
+        await importProfileTxt({ silent: true });
+    }
     await hydrateContextPanels();
     addSystemMessage('Jobs AI Assistant ready. Click "Scan Page" to begin.');
 })();

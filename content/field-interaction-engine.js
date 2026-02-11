@@ -104,23 +104,19 @@ async function selectAutocompleteOption(inputElement, value) {
         return false;
     }
 
+    // Clear any pre-filled value first
+    inputElement.value = '';
+    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+    inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+    await delay(80);
+
     inputElement.focus();
     await delay(100);
 
     // Open menu using real click and keyboard
     realClick(inputElement);
     inputElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowDown' }));
-    await delay(120);
-
-    // Type value to filter options
-    inputElement.value = '';
-    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-    for (const char of String(value)) {
-        inputElement.value += char;
-        inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-        await delay(20);
-    }
-    await delay(220);
+    await delay(200);
 
     const listboxRoot = resolveListboxRoot(inputElement);
     const options = getVisibleOptions(listboxRoot);
@@ -142,8 +138,14 @@ async function selectAutocompleteOption(inputElement, value) {
         return true;
     }
 
-    // Some widgets keep selected value outside input element; trust click if option was visible and clicked
-    return true;
+    // Some widgets render selected value in sibling container
+    const wrapper = inputElement.closest('[role="combobox"], [class*="select"], [class*="react-select"]') || inputElement.parentElement;
+    const wrapperText = normalizeText(wrapper?.textContent || '');
+    if (wrapperText.includes(targetValue)) {
+        return true;
+    }
+
+    return false;
 }
 
 /**

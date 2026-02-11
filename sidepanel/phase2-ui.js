@@ -7,6 +7,51 @@ console.log('Phase 2: UI module loaded');
 // RESUME UPLOAD SECTION
 // ============================================
 
+async function loadDefaultResumeFromServer({ silent = false } = {}) {
+    const response = await fetch('http://localhost:3002/api/load-default-resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    });
+
+    if (!response.ok) {
+        throw new Error(`Server error: ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    if (!result.success || !result.resumeFile) {
+        throw new Error(result.error || 'No default resume available');
+    }
+
+    await chrome.storage.local.set({
+        resumeFile: result.resumeFile
+    });
+
+    const existing = await chrome.storage.local.get('profile');
+    await chrome.storage.local.set({
+        profile: {
+            ...(existing.profile || {}),
+            resumeText: result.resumeFile.text || '',
+            resumeMetadata: result.resumeFile.metadata || {}
+        }
+    });
+
+    if (!silent && typeof addSystemMessage === 'function') {
+        addSystemMessage(`Loaded default resume from /resume: ${result.resumeFile.name}`);
+    }
+
+    return result.resumeFile;
+}
+
+async function ensureResumeAvailable(options = {}) {
+    const existing = await chrome.storage.local.get('resumeFile');
+    if (existing.resumeFile) {
+        return existing.resumeFile;
+    }
+
+    return loadDefaultResumeFromServer(options);
+}
+
 /**
  * Initialize resume upload functionality
  */
@@ -132,15 +177,25 @@ function initResumeUpload() {
             try {
                 addSystemMessage('Auto-uploading resume to application page...');
                 autoUploadBtn.disabled = true;
+
+                await ensureResumeAvailable({ silent: true });
                 
                 const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
                 
-                const response = await chrome.tabs.sendMessage(tab.id, {
+                let response = await chrome.tabs.sendMessage(tab.id, {
                     action: 'autoUploadResume'
                 });
+
+                if (response?.error === 'Unknown action') {
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                    response = await chrome.tabs.sendMessage(tab.id, {
+                        action: 'autoUploadResume'
+                    });
+                }
                 
                 if (response && response.success) {
-                    addSystemMessage(`✓ Resume uploaded! Cleared ${response.clearedFields} pre-filled fields.`);
+                    const fileName = response.uploadedFile ? ` (${response.uploadedFile})` : '';
+                    addSystemMessage(`✓ Resume uploaded${fileName}! Cleared ${response.clearedFields} pre-filled fields.`);
                     addSystemMessage('Ready to scan page. Click "Scan Page" to continue.');
                     
                     // Enable scan button
@@ -168,13 +223,23 @@ function initResumeUpload() {
  */
 async function loadResumeStatus() {
     try {
-        const result = await chrome.storage.local.get('resumeFile');
+        let result = await chrome.storage.local.get('resumeFile');
         const resumeStatus = document.getElementById('resumeStatus');
         const autoUploadBtn = document.getElementById('autoUploadResumeBtn');
         
+        if (!result.resumeFile) {
+            try {
+                const loaded = await ensureResumeAvailable({ silent: true });
+                result = { resumeFile: loaded };
+            } catch (error) {
+                console.warn('[Phase2-UI] No default resume preloaded:', error.message);
+            }
+        }
+
         if (result.resumeFile) {
             const resume = result.resumeFile;
-            resumeStatus.textContent = `✓ ${resume.name} (uploaded ${new Date(resume.uploadedAt).toLocaleDateString()})`;
+            const uploadedAt = resume.uploadedAt ? new Date(resume.uploadedAt).toLocaleDateString() : 'preloaded';
+            resumeStatus.textContent = `✓ ${resume.name} (${uploadedAt})`;
             resumeStatus.className = 'resume-status success';
             
             // Enable auto-upload button

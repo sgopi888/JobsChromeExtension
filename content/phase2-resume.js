@@ -79,11 +79,18 @@ async function clearAllPreFilledFields() {
                 continue;
             }
             
+            const originalValue = field.value;
+            const fieldId = field.id || field.name || field.getAttribute('aria-label') || field.placeholder || '';
+
             // Clear the field
             field.value = '';
             field.dispatchEvent(new Event('input', { bubbles: true }));
             field.dispatchEvent(new Event('change', { bubbles: true }));
             clearedCount++;
+
+            if (window.__JobsAI_Tracker?.markCleared && fieldId) {
+                window.__JobsAI_Tracker.markCleared(fieldId, originalValue);
+            }
         }
         
         console.log(`[Phase2-Resume] ✓ Cleared ${clearedCount} pre-filled fields`);

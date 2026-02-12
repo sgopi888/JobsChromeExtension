@@ -82,7 +82,7 @@ class ButtonManager {
             }
 
             this.showMessage(`Starting text field filling (${textPlan.length} fields)...`);
-            await this.executeFillPlan(textPlan);
+            await this.executeFillPlan(textPlan, 'text');
         } catch (error) {
             console.error('[ButtonManager] Error filling text fields:', error);
             this.showMessage(`Error: ${error.message}`, 'error');
@@ -112,14 +112,14 @@ class ButtonManager {
             }
 
             this.showMessage(`Starting menu filling (${menuPlan.length} fields)...`);
-            await this.executeFillPlan(menuPlan);
+            await this.executeFillPlan(menuPlan, 'menus');
         } catch (error) {
             console.error('[ButtonManager] Error filling menus:', error);
             this.showMessage(`Error: ${error.message}`, 'error');
         }
     }
 
-    async executeFillPlan(fillPlan) {
+    async executeFillPlan(fillPlan, mode = 'full') {
         try {
             // Disable buttons during execution
             this.disableButtons();
@@ -153,7 +153,8 @@ class ButtonManager {
                 action: 'startFilling',
                 data: {
                     fillPlan,
-                    fields
+                    fields,
+                    mode
                 }
             });
 

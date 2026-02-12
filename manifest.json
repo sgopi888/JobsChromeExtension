@@ -23,6 +23,7 @@
         "content/unified-logger.js",
         "content/field-metadata-manager.js",
         "content/field-interaction-engine.js",
+        "content/field-filler-v2.js",
         "content/content-script.js",
         "content/phase2-resume.js",
         "content/phase3-auto-upload.js"

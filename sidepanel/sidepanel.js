@@ -171,7 +171,8 @@ fillBtn.addEventListener('click', async () => {
         action: 'startFilling',
         data: {
             fillPlan: state.session.fillPlan,
-            fields: currentFields  // Pass field metadata for lookup
+            fields: currentFields,  // Pass field metadata for lookup
+            mode: 'full'
         }
     }, (response) => {
         if (response && response.success) {

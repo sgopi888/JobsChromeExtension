@@ -1,5 +1,10 @@
 // Content script - injected into job application pages
 // Handles form detection, field filling, and stealth behavior
+//
+// NOTE: V2 MIGRATION IN PROGRESS
+// - Select/Check/Radio fields now use field-filler-v2.js (simple, direct, no fallbacks)
+// - Text fields still use existing humanLikeType() (works well)
+// - Old selectOption() and checkBox() marked DEPRECATED, will remove after V2 confirmed working
 
 console.log('Jobs AI Content Script loaded');
 
@@ -13,6 +18,10 @@ if (!window.__JOBS_AI_LISTENER_ATTACHED__) {
     // Listen for messages from background/sidepanel
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         console.log('Content script received:', message.action);
+        if ((message.action === 'scanPage' || message.action === 'startFilling') && window.self !== window.top) {
+            console.log('[ContentScript] Ignoring message in non-top frame:', message.action);
+            return false;
+        }
 
         switch (message.action) {
             case 'scanPage':
@@ -52,9 +61,8 @@ if (!window.__JOBS_AI_LISTENER_ATTACHED__) {
 // Scan page for form fields
 async function handleScanPage(sendResponse) {
     try {
-        // Reset filled fields tracker on new scan
-        resetFilledFieldsTracker();
-        console.log('[ContentScript] Reset filled fields tracker on new page scan');
+        // Only reset tracker on URL change
+        resetTrackerIfUrlChanged();
 
         const fields = await detectFormFields();
         sendResponse({ success: true, fields });
@@ -502,6 +510,7 @@ async function handleStartFilling(data, sendResponse) {
     try {
         isProcessing = true;
         currentFillPlan = data.fillPlan || [];
+        currentFillMode = String(data?.mode || 'full').toLowerCase();
         notifySidePanel({ type: 'fill_started', mode: data?.mode || 'Full', items: currentFillPlan.length });
         
         // Store field metadata for lookup
@@ -527,20 +536,67 @@ async function handleStartFilling(data, sendResponse) {
 // Execute the fill plan
 // Track filled fields to prevent duplicate fills (session-scoped)
 const filledFieldsTracker = new Map();
+let trackerUrl = window.location.href;
+let currentFillMode = 'full';
 
-function resetFilledFieldsTracker() {
-    filledFieldsTracker.clear();
+function makeTrackerKey(fieldId, action, value, isMulti) {
+    const actionKey = String(action || 'unknown').toLowerCase();
+    if (isMulti) {
+        return `${fieldId}::${actionKey}::${normalizeTrackerValue(value)}`;
+    }
+    return `${fieldId}::${actionKey}`;
 }
 
-function markFieldAsFilled(fieldId, value) {
-    filledFieldsTracker.set(fieldId, { value, timestamp: Date.now() });
+function resetTrackerIfUrlChanged() {
+    if (trackerUrl !== window.location.href) {
+        filledFieldsTracker.clear();
+        trackerUrl = window.location.href;
+        console.log('[ContentScript] Tracker reset due to URL change');
+    }
 }
 
-function isFieldAlreadyFilled(fieldId, value) {
-    const record = filledFieldsTracker.get(fieldId);
+function normalizeTrackerValue(value) {
+    if (value === null || value === undefined) return '';
+    if (Array.isArray(value)) {
+        return value.map(v => String(v || '').trim().toLowerCase()).join('|');
+    }
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    return String(value).trim().toLowerCase();
+}
+
+function markFieldAsFilled(fieldId, action, value, success = true, isMulti = false) {
+    resetTrackerIfUrlChanged();
+    const key = makeTrackerKey(fieldId, action, value, isMulti);
+    filledFieldsTracker.set(key, {
+        value: normalizeTrackerValue(value),
+        success,
+        mode: currentFillMode,
+        timestamp: Date.now()
+    });
+}
+
+function isFieldAlreadyFilled(fieldId, action, value, isMulti = false) {
+    resetTrackerIfUrlChanged();
+    const key = makeTrackerKey(fieldId, action, value, isMulti);
+    const record = filledFieldsTracker.get(key);
     if (!record) return false;
-    // Allow re-fill if value is different
-    return record.value === value;
+    if (!record.success) return false;
+    return record.value === normalizeTrackerValue(value);
+}
+
+function getTrackerStats() {
+    let successCount = 0;
+    let failCount = 0;
+    for (const record of filledFieldsTracker.values()) {
+        if (record.success) successCount += 1;
+        else failCount += 1;
+    }
+    return {
+        total: filledFieldsTracker.size,
+        success: successCount,
+        failed: failCount,
+        mode: currentFillMode
+    };
 }
 
 async function executeFillPlan(fillPlan) {
@@ -564,7 +620,7 @@ async function executeFillPlan(fillPlan) {
         const item = fillPlan[i];
 
         // Skip if already filled with same value
-        if (isFieldAlreadyFilled(item.fieldId, item.value)) {
+        if (isFieldAlreadyFilled(item.fieldId, item.action, item.value, Boolean(item.multi))) {
             console.log(`[ContentScript] Skipping already-filled field: ${item.fieldId}`);
             notifySidePanel({ type: 'skipped', field: item.fieldId, reason: 'already_filled' });
             continue;
@@ -574,9 +630,6 @@ async function executeFillPlan(fillPlan) {
             notifySidePanel({ type: 'filling', field: item.fieldId, action: item.action });
 
             await fillField(item);
-
-            // Mark as filled
-            markFieldAsFilled(item.fieldId, item.value);
 
             // Log success
             logAction({
@@ -590,6 +643,8 @@ async function executeFillPlan(fillPlan) {
 
         } catch (error) {
             console.error(`Error filling ${item.fieldId}:`, error);
+
+            markFieldAsFilled(item.fieldId, item.action, item.value, false, Boolean(item.multi));
 
             logAction({
                 action: 'failed',
@@ -606,6 +661,7 @@ async function executeFillPlan(fillPlan) {
     }
 
     notifySidePanel({ type: 'complete' });
+    console.log('[ContentScript] Tracker stats:', getTrackerStats());
 }
 
 // Fill a single field based on action type
@@ -615,6 +671,12 @@ async function fillField(item) {
     if (!element) {
         notifySidePanel({ type: 'element_not_found', field: item.fieldId, action: item.action });
         throw new Error(`Element not found: ${item.fieldId}`);
+    }
+
+    if (hasCorrectValue(element, item)) {
+        markFieldAsFilled(item.fieldId, item.action, item.value, true, Boolean(item.multi));
+        notifySidePanel({ type: 'skipped', field: item.fieldId, reason: 'already_correct' });
+        return;
     }
 
     // Scroll element into view
@@ -631,15 +693,25 @@ async function fillField(item) {
             break;
 
         case 'select':
-            await selectOption(element, item);
-            break;
-
         case 'check':
-            await checkBox(element, item);
-            break;
-
         case 'radio':
-            await checkBox(element, { ...item, action: 'check' });
+        case 'multiselect':
+            // USE NEW V2 FILLER - Simple, direct, no fallbacks
+            console.log(`[ContentScript] Using V2 filler for ${item.action}`);
+            if (window.FieldFillerV2) {
+                const result = await window.FieldFillerV2.fillFieldV2(item);
+                if (!result.success) {
+                    throw new Error(result.error || 'V2 filler failed');
+                }
+            } else {
+                // Fallback to old method if V2 not loaded (shouldn't happen)
+                console.warn('[ContentScript] V2 filler not loaded, using old method');
+                if (item.action === 'select') {
+                    await selectOption(element, item);
+                } else {
+                    await checkBox(element, item);
+                }
+            }
             break;
 
         case 'upload':
@@ -654,6 +726,69 @@ async function fillField(item) {
         default:
             console.warn(`Unknown action: ${item.action}`);
     }
+
+    if (!verifyFillResult(element, item)) {
+        throw new Error(`Verification failed for ${item.fieldId}`);
+    }
+
+    markFieldAsFilled(item.fieldId, item.action, item.value, true, Boolean(item.multi));
+}
+
+function hasCorrectValue(element, item) {
+    if (!item || !element) return false;
+    const action = String(item.action || '').toLowerCase();
+    if (action === 'type') return verifyTextFill(element, item.value);
+    if (action === 'select') return verifySelectFill(element, item);
+    if (action === 'check' || action === 'radio') return verifyCheckFill(element, item);
+    return false;
+}
+
+function verifyFillResult(element, item) {
+    const action = String(item.action || '').toLowerCase();
+    if (action === 'type') return verifyTextFill(element, item.value);
+    if (action === 'select') return verifySelectFill(element, item);
+    if (action === 'check' || action === 'radio') return verifyCheckFill(element, item);
+    if (action === 'upload' || action === 'skip') return true;
+    return true;
+}
+
+function normalizeInputText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function getCurrentTextValue(element) {
+    if (!element) return '';
+    if (element.isContentEditable || ((element.getAttribute('role') || '').toLowerCase() === 'textbox' && element.tagName !== 'INPUT' && element.tagName !== 'TEXTAREA')) {
+        return element.innerText || '';
+    }
+    return typeof element.value === 'string' ? element.value : '';
+}
+
+function verifyTextFill(element, expectedValue) {
+    const expected = normalizeInputText(expectedValue);
+    if (!expected) return false;
+    const actual = normalizeInputText(getCurrentTextValue(element));
+    return actual === expected;
+}
+
+function verifyCheckFill(element, item) {
+    const shouldCheck = normalizeShouldBeChecked(item);
+    if (!element) return false;
+    return Boolean(element.checked) === shouldCheck;
+}
+
+function verifySelectFill(element, item) {
+    const expected = normalizeOptionText(item?.value || '');
+    if (!expected) return false;
+    const snapshot = getControlSelectionSnapshot(element);
+    if (!snapshot) return false;
+
+    if (item?.multi) {
+        const parts = snapshot.split('|').filter(Boolean);
+        return parts.some(part => isStrongMatch(part, expected));
+    }
+
+    return isStrongMatch(snapshot, expected);
 }
 
 // Human-like typing simulation
@@ -694,6 +829,8 @@ async function fillRichText(element, text) {
     await randomDelay(80, 140);
 }
 
+// DEPRECATED: This function is being replaced by field-filler-v2.js
+// TODO: Remove after V2 is confirmed working
 // Select option from dropdown - CLICK-BASED APPROACH
 async function selectOption(element, item) {
     const fieldId = item?.fieldId || '';
@@ -716,6 +853,7 @@ async function selectOption(element, item) {
                 console.log('[ContentScript] ✓ Dropdown selected using click-based engine');
                 return;
             }
+            await waitMs(120);
             if (targetValue && controlDisplaysValue(element, targetValue, preSnapshot)) {
                 console.log('[ContentScript] ✓ Dropdown selection detected after engine attempt');
                 return;
@@ -733,6 +871,7 @@ async function selectOption(element, item) {
                 console.log('[ContentScript] ✓ Autocomplete selected using click-based engine');
                 return;
             }
+            await waitMs(120);
             if (targetValue && controlDisplaysValue(element, targetValue, preSnapshot)) {
                 console.log('[ContentScript] ✓ Autocomplete selection detected after engine attempt');
                 return;
@@ -843,13 +982,33 @@ function getControlSelectionSnapshot(element) {
 }
 
 function controlDisplaysValue(element, targetValue, beforeSnapshot = '') {
+    if (!targetValue) return false;
     const afterSnapshot = getControlSelectionSnapshot(element);
     if (!afterSnapshot) return false;
-    if (afterSnapshot.includes(targetValue)) return true;
-    if (beforeSnapshot && afterSnapshot !== beforeSnapshot && targetValue) {
+    return isStrongMatch(afterSnapshot, targetValue);
+}
+
+function isStrongMatch(actualText, targetText) {
+    const actual = normalizeOptionText(actualText);
+    const target = normalizeOptionText(targetText);
+    if (!actual || !target) return false;
+    if (actual === target) return true;
+    if (target.includes('linkedin') && (actual.includes('professional network') || actual.includes('online professional network'))) {
         return true;
     }
-    return false;
+
+    const actualTokens = actual.split(/\s+/).filter(Boolean);
+    const targetTokens = target.split(/\s+/).filter(Boolean);
+    if (!actualTokens.length || !targetTokens.length) return false;
+
+    let overlap = 0;
+    const targetSet = new Set(targetTokens);
+    for (const token of actualTokens) {
+        if (targetSet.has(token)) overlap += 1;
+    }
+
+    const ratio = overlap / Math.max(actualTokens.length, targetTokens.length);
+    return ratio >= 0.5;
 }
 
 async function selectCustomOption(element, value, fieldId = '') {
@@ -1024,6 +1183,8 @@ function isVisibleElement(node) {
         style.opacity !== '0';
 }
 
+// DEPRECATED: This function is being replaced by field-filler-v2.js
+// TODO: Remove after V2 is confirmed working
 // Check/uncheck checkbox - CLICK-BASED APPROACH
 async function checkBox(element, item) {
     const shouldCheck = normalizeShouldBeChecked(item);
@@ -1341,6 +1502,21 @@ function randomDelay(min, max) {
     const delay = Math.floor(Math.random() * (max - min + 1)) + min;
     return new Promise(resolve => setTimeout(resolve, delay));
 }
+
+function markFieldAsCleared(fieldId, originalValue) {
+    markFieldAsFilled(fieldId, 'resume-cleared', originalValue, true);
+}
+
+window.__JobsAI_Tracker = {
+    getAll: () => Array.from(filledFieldsTracker.entries()),
+    getStats: () => getTrackerStats(),
+    check: (fieldId, action, value, isMulti = false) => isFieldAlreadyFilled(fieldId, action, value, isMulti),
+    forceReset: () => {
+        filledFieldsTracker.clear();
+        trackerUrl = window.location.href;
+    },
+    markCleared: (fieldId, originalValue) => markFieldAsCleared(fieldId, originalValue)
+};
 
 // Notify side panel of events
 function notifySidePanel(data) {

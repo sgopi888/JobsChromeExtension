@@ -4,7 +4,6 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
-from datetime import datetime
 
 from forms_extraction import extract_fields
 from llm_call import generate_fill_json, load_env
@@ -19,16 +18,9 @@ ENV_MAP = load_env(ENV_PATH)
 
 
 class PipelineHandler(BaseHTTPRequestHandler):
-    def _cors_headers(self):
-        origin = os.getenv("PIPELINE_CORS_ORIGIN", "*")
-        self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-
     def _send_json(self, status_code: int, payload: dict):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
-        self._cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -44,17 +36,6 @@ class PipelineHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("Request body must be a JSON object.")
         return payload
-
-    def do_OPTIONS(self):
-        if urlparse(self.path).path not in {"/pipeline", "/health"}:
-            self.send_response(404)
-            self._cors_headers()
-            self.end_headers()
-            return
-
-        self.send_response(204)
-        self._cors_headers()
-        self.end_headers()
 
     def do_POST(self):
         if urlparse(self.path).path != "/pipeline":
@@ -72,11 +53,6 @@ class PipelineHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "bad_request", "detail": "Missing 'url' in request body."})
             return
 
-        started_at = datetime.utcnow().isoformat() + "Z"
-        print("\n========== PIPELINE REQUEST ==========")
-        print(f"time_utc: {started_at}")
-        print(f"url: {url}")
-
         try:
             fields = extract_fields(url)
         except ValueError as error:
@@ -93,16 +69,6 @@ class PipelineHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "context_read_failed", "detail": str(error)})
             return
 
-        request_context = {
-            "url": url,
-            "field_count": int(fields.get("field_count") or 0),
-            "fields_count": len(fields.get("fields") or []),
-            "profile_chars": len(profile_text),
-            "resume_chars": len(resume_text),
-        }
-        print("context:")
-        print(json.dumps(request_context, indent=2, ensure_ascii=False))
-
         try:
             result = generate_fill_json(fields, profile_text, resume_text, env_map=ENV_MAP)
         except RuntimeError as error:
@@ -113,10 +79,6 @@ class PipelineHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._send_json(502, {"error": "llm_failed", "detail": str(error)})
             return
-
-        print("llm_response:")
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        print("========== END PIPELINE ==========\n")
 
         self._send_json(200, result)
 
@@ -132,7 +94,7 @@ class PipelineHandler(BaseHTTPRequestHandler):
 
 def run_server():
     host = os.getenv("PIPELINE_HOST", "127.0.0.1")
-    port = int(os.getenv("PIPELINE_PORT", "8877"))
+    port = int(os.getenv("PIPELINE_PORT", "8889"))
     server = ThreadingHTTPServer((host, port), PipelineHandler)
     print(f"Pipeline API listening on http://{host}:{port}")
     server.serve_forever()

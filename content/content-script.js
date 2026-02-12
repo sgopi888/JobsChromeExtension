@@ -502,6 +502,7 @@ async function handleStartFilling(data, sendResponse) {
     try {
         isProcessing = true;
         currentFillPlan = data.fillPlan || [];
+        notifySidePanel({ type: 'fill_started', mode: data?.mode || 'Full', items: currentFillPlan.length });
         
         // Store field metadata for lookup
         window.fieldMetadata = {};
@@ -612,6 +613,7 @@ async function fillField(item) {
     const element = findElement(item.fieldId, item.action);
 
     if (!element) {
+        notifySidePanel({ type: 'element_not_found', field: item.fieldId, action: item.action });
         throw new Error(`Element not found: ${item.fieldId}`);
     }
 
@@ -629,7 +631,7 @@ async function fillField(item) {
             break;
 
         case 'select':
-            await selectOption(element, item.value);
+            await selectOption(element, item);
             break;
 
         case 'check':
@@ -693,8 +695,17 @@ async function fillRichText(element, text) {
 }
 
 // Select option from dropdown - CLICK-BASED APPROACH
-async function selectOption(element, value) {
+async function selectOption(element, item) {
+    const fieldId = item?.fieldId || '';
+    const value = item?.value;
+    const allowMultiple = Boolean(item?.multi);
     console.log(`[ContentScript] selectOption: element=${element.tagName}, value="${value}"`);
+    const targetValue = normalizeOptionText(value);
+    const preSnapshot = getControlSelectionSnapshot(element);
+
+    if (!allowMultiple) {
+        clearExistingSelectionsIfMulti(element, targetValue);
+    }
 
     // Use the new click-based interaction engine
     if (window.FieldInteractionEngine) {
@@ -703,6 +714,10 @@ async function selectOption(element, value) {
             const success = await window.FieldInteractionEngine.selectDropdownByClick(element, value);
             if (success) {
                 console.log('[ContentScript] ✓ Dropdown selected using click-based engine');
+                return;
+            }
+            if (targetValue && controlDisplaysValue(element, targetValue, preSnapshot)) {
+                console.log('[ContentScript] ✓ Dropdown selection detected after engine attempt');
                 return;
             }
             // If failed, fall through to old method as backup
@@ -716,6 +731,10 @@ async function selectOption(element, value) {
             const success = await window.FieldInteractionEngine.selectAutocompleteOption(element, value);
             if (success) {
                 console.log('[ContentScript] ✓ Autocomplete selected using click-based engine');
+                return;
+            }
+            if (targetValue && controlDisplaysValue(element, targetValue, preSnapshot)) {
+                console.log('[ContentScript] ✓ Autocomplete selection detected after engine attempt');
                 return;
             }
             // If failed, fall through to custom click fallback
@@ -734,10 +753,17 @@ async function selectOption(element, value) {
     if (element.tagName === 'SELECT') {
         // Native select handling (old method)
         const options = Array.from(element.options);
-        const match = options.find(opt =>
+        let match = options.find(opt =>
             opt.value === value ||
             opt.text.toLowerCase().includes(String(value).toLowerCase())
         );
+
+        if (!match) {
+            match = findBestSelectOption(options, String(value || ''));
+            if (match) {
+                notifySidePanel({ type: 'select_fallback', field: fieldId || '', requested: String(value || ''), chosen: match.textContent.trim() });
+            }
+        }
 
         if (match) {
             element.value = match.value;
@@ -747,14 +773,86 @@ async function selectOption(element, value) {
         }
     } else {
         // Custom menu handling (combobox, listbox, button menus)
-        await selectCustomOption(element, value);
+        await selectCustomOption(element, value, fieldId);
     }
 
     element.blur();
     await randomDelay(100, 200);
 }
 
-async function selectCustomOption(element, value) {
+function clearExistingSelectionsIfMulti(element, targetValue) {
+    try {
+        const selectedLabels = getSelectedLabelsForControl(element);
+        if (!selectedLabels.length) return;
+
+        // If already selected, skip clearing to avoid churn.
+        if (targetValue && selectedLabels.some(label => label.includes(targetValue))) {
+            return;
+        }
+
+        const wrapper = element.closest('[role="combobox"], [class*="select"], [class*="react-select"]') || element.parentElement;
+        if (!wrapper) return;
+
+        const removeButtons = Array.from(wrapper.querySelectorAll('.select__multi-value__remove, [aria-label^="Remove"], [data-testid*="remove"], [class*="multi-value__remove"]'));
+        if (!removeButtons.length) return;
+
+        for (const btn of removeButtons) {
+            btn.click();
+        }
+    } catch (error) {
+        // best-effort
+    }
+}
+
+function getSelectedLabelsForControl(element) {
+    try {
+        if (!element) return [];
+        const wrapper = element.closest('[role="combobox"], [class*="select"], [class*="react-select"]') || element.parentElement;
+        if (!wrapper) return [];
+
+        const labels = [];
+        wrapper.querySelectorAll('.select__multi-value__label, .select__single-value, [data-value]').forEach(node => {
+            const text = normalizeOptionText(node.textContent || '');
+            if (text) labels.push(text);
+        });
+
+        if (labels.length) return labels;
+
+        const snapshot = normalizeOptionText(wrapper.textContent || '');
+        return snapshot ? [snapshot] : [];
+    } catch (error) {
+        return [];
+    }
+}
+
+function getControlSelectionSnapshot(element) {
+    try {
+        if (!element) return '';
+        if (element.tagName === 'SELECT') {
+            return Array.from(element.selectedOptions || [])
+                .map(opt => normalizeOptionText(opt.textContent || opt.value))
+                .filter(Boolean)
+                .join('|');
+        }
+        const wrapper = element.closest('[role="combobox"], [class*="select"], [class*="react-select"]') || element.parentElement;
+        const text = wrapper ? wrapper.textContent : element.textContent;
+        return normalizeOptionText(text || '');
+    } catch (error) {
+        return '';
+    }
+}
+
+function controlDisplaysValue(element, targetValue, beforeSnapshot = '') {
+    const afterSnapshot = getControlSelectionSnapshot(element);
+    if (!afterSnapshot) return false;
+    if (afterSnapshot.includes(targetValue)) return true;
+    if (beforeSnapshot && afterSnapshot !== beforeSnapshot && targetValue) {
+        return true;
+    }
+    return false;
+}
+
+async function selectCustomOption(element, value, fieldId = '') {
     const targetValue = normalizeOptionText(value);
     if (!targetValue) {
         throw new Error(`Invalid option value: ${value}`);
@@ -774,7 +872,20 @@ async function selectCustomOption(element, value) {
     }
 
     if (!option) {
-        throw new Error(`Custom option not found: ${value}`);
+        // Fuzzy fallback: pick best option by token overlap / includes
+        const root = scopedRoot || document;
+        const candidates = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], .select__option'))
+            .filter(isVisibleElement)
+            .filter(node => normalizeOptionText(node.textContent));
+        option = pickBestOptionMatch(candidates, targetValue, { allowFuzzy: true });
+        if (!option) {
+            throw new Error(`Custom option not found: ${value}`);
+        }
+    }
+
+    const chosenText = normalizeOptionText(option.textContent);
+    if (chosenText && chosenText !== targetValue) {
+        notifySidePanel({ type: 'select_fallback', field: fieldId || '', requested: String(value || ''), chosen: option.textContent.trim() });
     }
 
     option.click();
@@ -828,14 +939,71 @@ function findInlineChoice(element, targetText) {
     return pickBestOptionMatch(inlineCandidates, targetText);
 }
 
-function pickBestOptionMatch(candidates, targetText) {
+function pickBestOptionMatch(candidates, targetText, { allowFuzzy = false } = {}) {
     const exact = candidates.find(node => normalizeOptionText(node.textContent) === targetText);
     if (exact) return exact;
 
     const startsWith = candidates.find(node => normalizeOptionText(node.textContent).startsWith(targetText));
     if (startsWith) return startsWith;
 
-    return candidates.find(node => normalizeOptionText(node.textContent).includes(targetText)) || null;
+    const includes = candidates.find(node => normalizeOptionText(node.textContent).includes(targetText));
+    if (includes) return includes;
+
+    if (targetText.includes('linkedin')) {
+        const alias = candidates.find(node => {
+            const text = normalizeOptionText(node.textContent);
+            return text.includes('professional network') || text.includes('online professional network');
+        });
+        if (alias) return alias;
+    }
+
+    if (!allowFuzzy) return null;
+
+    const targetTokens = new Set(targetText.split(/\s+/).filter(Boolean));
+    if (targetTokens.size === 0) return null;
+
+    let best = null;
+    let bestScore = 0;
+    for (const node of candidates) {
+        const text = normalizeOptionText(node.textContent);
+        const tokens = text.split(/\s+/).filter(Boolean);
+        if (tokens.length === 0) continue;
+        let overlap = 0;
+        for (const token of tokens) {
+            if (targetTokens.has(token)) overlap += 1;
+        }
+        const score = overlap / Math.max(targetTokens.size, tokens.length);
+        if (score > bestScore) {
+            bestScore = score;
+            best = node;
+        }
+    }
+
+    return bestScore >= 0.4 ? best : null;
+}
+
+function findBestSelectOption(options, targetText) {
+    const normalizedTarget = normalizeOptionText(targetText);
+    if (!normalizedTarget) return null;
+
+    const exact = options.find(opt => normalizeOptionText(opt.textContent || opt.value) === normalizedTarget);
+    if (exact) return exact;
+
+    const startsWith = options.find(opt => normalizeOptionText(opt.textContent || opt.value).startsWith(normalizedTarget));
+    if (startsWith) return startsWith;
+
+    const includes = options.find(opt => normalizeOptionText(opt.textContent || opt.value).includes(normalizedTarget));
+    if (includes) return includes;
+
+    if (normalizedTarget.includes('linkedin')) {
+        const alias = options.find(opt => {
+            const text = normalizeOptionText(opt.textContent || opt.value);
+            return text.includes('professional network') || text.includes('online professional network');
+        });
+        if (alias) return alias;
+    }
+
+    return null;
 }
 
 function normalizeOptionText(text) {

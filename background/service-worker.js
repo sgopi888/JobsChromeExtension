@@ -1,6 +1,138 @@
 // Background service worker - manages state and coordinates between content script and server
 
 const API_BASE = 'http://localhost:3002/api';
+const PIPELINE_API_BASE = 'http://127.0.0.1:8877';
+
+function emitUiLog(level, message, { location = 'pipeline', type = 'regular' } = {}) {
+    const payload = {
+        level,
+        message,
+        timestamp: new Date().toISOString(),
+        location,
+        type
+    };
+
+    chrome.runtime.sendMessage({
+        action: 'displayLog',
+        data: payload
+    }).catch(() => {});
+}
+
+function pipelineLog(stage, message, data = null, level = 'info') {
+    const line = `[${stage}] ${message}`;
+    emitUiLog(level, line, { location: 'pipeline', type: 'regular' });
+
+    if (data !== null && data !== undefined) {
+        const detailed = JSON.stringify({ stage, message, data }, null, 2);
+        emitUiLog(level, detailed, { location: 'pipeline', type: 'detailed' });
+    }
+}
+
+function toFillPlanFromPipelineMaster(pipelineMaster) {
+    const filledFields = Array.isArray(pipelineMaster?.filled_fields) ? pipelineMaster.filled_fields : [];
+
+    const typeFieldTypes = new Set(['text', 'textarea', 'tel', 'email', 'url', 'number', 'date', 'richtext']);
+    const plan = [];
+    const seen = new Set();
+
+    let typeCount = 0;
+    let selectCount = 0;
+    let uploadCount = 0;
+    let ignoredCount = 0;
+    let checkCount = 0;
+
+    for (const field of filledFields) {
+        const fieldId = String(field?.id || '').trim();
+        const fieldType = String(field?.field_type || '').trim().toLowerCase();
+        const value = field?.value;
+
+        if (!fieldId) {
+            ignoredCount += 1;
+            continue;
+        }
+
+        const isEmptyString = typeof value === 'string' && value.trim() === '';
+        const isEmptyArray = Array.isArray(value) && value.length === 0;
+        if (isEmptyString || isEmptyArray || value === null || value === undefined) {
+            ignoredCount += 1;
+            continue;
+        }
+
+        if (typeFieldTypes.has(fieldType)) {
+            const item = {
+                fieldId,
+                action: 'type',
+                value: typeof value === 'string' ? value : String(value ?? '')
+            };
+            const key = `${item.fieldId}|${item.action}|${item.value}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                plan.push(item);
+                typeCount += 1;
+            }
+            continue;
+        }
+
+        if (fieldType === 'select') {
+            const isMulti = Array.isArray(value);
+            const values = isMulti ? value : [value];
+            for (const entry of values) {
+                const entryValue = typeof entry === 'string' ? entry : String(entry ?? '');
+                if (!entryValue) continue;
+                const item = {
+                    fieldId,
+                    action: 'select',
+                    value: entryValue,
+                    multi: isMulti
+                };
+                const key = `${item.fieldId}|${item.action}|${item.value}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    plan.push(item);
+                    selectCount += 1;
+                }
+            }
+            continue;
+        }
+
+        if (fieldType === 'file') {
+            const item = {
+                fieldId,
+                action: 'upload',
+                value: ''
+            };
+            const key = `${item.fieldId}|${item.action}|${item.value}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                plan.push(item);
+                uploadCount += 1;
+            }
+            continue;
+        }
+
+        if (fieldType === 'checkbox_group') {
+            const item = {
+                fieldId,
+                action: 'check',
+                value: true
+            };
+            const key = `${item.fieldId}|${item.action}|${item.value}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                plan.push(item);
+                checkCount += 1;
+            }
+            continue;
+        }
+
+        ignoredCount += 1;
+    }
+
+    return {
+        fillPlan: plan,
+        counts: { typeCount, selectCount, uploadCount, checkCount, ignoredCount, total: plan.length }
+    };
+}
 
 // Initialize extension
 chrome.runtime.onInstalled.addListener(() => {
@@ -54,6 +186,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('Background received message:', message.action);
 
     switch (message.action) {
+        case 'pipelineScan':
+            handlePipelineScan(message.data, sendResponse);
+            return true;
+
         case 'analyzeFields':
             handleAnalyzeFields(message.data, sendResponse);
             return true; // Keep channel open for async response
@@ -101,6 +237,84 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ error: 'Unknown action' });
     }
 });
+
+async function handlePipelineScan(data, sendResponse) {
+    const url = String(data?.url || '').trim();
+    if (!url) {
+        pipelineLog('error', "Missing 'url' for pipeline scan.", { data }, 'error');
+        sendResponse({ success: false, error: "Missing 'url'" });
+        return;
+    }
+
+    const requestContext = {
+        url,
+        startedAt: new Date().toISOString(),
+        pipelineEndpoint: `${PIPELINE_API_BASE}/pipeline`,
+        activeTabUrl: url,
+        scanFieldCount: typeof data?.scanFieldCount === 'number' ? data.scanFieldCount : undefined,
+        pageTitle: data?.pageTitle || undefined
+    };
+
+    pipelineLog('pipeline_request', 'Calling Python pipeline.', requestContext, 'info');
+
+    try {
+        const response = await fetch(`${PIPELINE_API_BASE}/pipeline`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+
+        const rawText = await response.text();
+        if (!response.ok) {
+            pipelineLog('error', `Pipeline error HTTP ${response.status}.`, { status: response.status, body: rawText }, 'error');
+            sendResponse({ success: false, error: rawText || `Pipeline error: ${response.status}` });
+            return;
+        }
+
+        let pipelineMaster;
+        try {
+            pipelineMaster = JSON.parse(rawText);
+        } catch (parseError) {
+            pipelineLog('error', 'Pipeline returned non-JSON response.', { rawText }, 'error');
+            sendResponse({ success: false, error: 'Pipeline returned invalid JSON.' });
+            return;
+        }
+
+        const filledCount = Array.isArray(pipelineMaster?.filled_fields) ? pipelineMaster.filled_fields.length : 0;
+        pipelineLog('pipeline_response', `Pipeline response received (${filledCount} filled_fields).`, pipelineMaster, 'info');
+
+        const { fillPlan, counts } = toFillPlanFromPipelineMaster(pipelineMaster);
+        pipelineLog('convert_fillplan', 'Converted master JSON to fillPlan.', counts, 'info');
+
+        const stored = await chrome.storage.local.get(['session']);
+        const activeSession = stored.session || { sessionId: generateSessionId() };
+        await chrome.storage.local.set({
+            session: {
+                ...activeSession,
+                status: 'ready',
+                currentUrl: url,
+                pipeline: {
+                    requestContext,
+                    master: pipelineMaster,
+                    counts,
+                    convertedAt: new Date().toISOString()
+                },
+                fillPlan
+            }
+        });
+
+        sendResponse({
+            success: true,
+            requestContext,
+            pipelineMaster,
+            fillPlan,
+            counts
+        });
+    } catch (error) {
+        pipelineLog('error', 'Pipeline request failed.', { message: error?.message || String(error) }, 'error');
+        sendResponse({ success: false, error: error?.message || String(error) });
+    }
+}
 
 // Analyze form fields with AI
 async function handleAnalyzeFields(data, sendResponse) {

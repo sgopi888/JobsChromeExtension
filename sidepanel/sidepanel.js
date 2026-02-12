@@ -37,10 +37,27 @@ function switchTab(tabName) {
 // Scan page for form fields
 scanBtn.addEventListener('click', async () => {
     updateStatus('Scanning...');
-    addSystemMessage('Scanning page for form fields...');
+    addSystemMessage('Starting pipeline scan...');
 
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
+    const requestContext = {
+        url: tab.url || '',
+        startedAt: new Date().toISOString(),
+        pipelineEndpoint: 'http://127.0.0.1:8877/pipeline',
+        activeTabUrl: tab.url || '',
+        pageTitle: tab.title || ''
+    };
+    updateContextDisplay('pipelineRequestContext', JSON.stringify(requestContext, null, 2));
+    addSystemMessage(`Pipeline request queued for: ${requestContext.url}`);
+    addAssistantMessage(`Pipeline request context:\n${JSON.stringify(requestContext, null, 2)}`);
+
+    // Call Python pipeline first (no browser scan required for values).
+    await pipelineScanFromBackend(requestContext);
+
+    // Keep DOM scan as a best-effort locator helper for filling (selectors/originalId),
+    // but do not treat it as a source of truth for values.
+    addSystemMessage('Locating fields on page (DOM scan)...');
     chrome.tabs.sendMessage(tab.id, { action: 'scanPage' }, async (response) => {
         if (response && response.success) {
             currentFields = response.fields;
@@ -51,17 +68,51 @@ scanBtn.addEventListener('click', async () => {
                     currentUrl: tab.url || ''
                 }
             });
-            addSystemMessage(`Found ${response.fields.length} fields`);
+            addSystemMessage(`DOM scan found ${response.fields.length} fields (locator metadata only).`);
             updateContextDisplay('fieldsContext', JSON.stringify(response.fields, null, 2));
-
-            // Send to AI for analysis
-            await analyzeFields(response.fields);
         } else {
-            addSystemMessage('Error scanning page', 'error');
-            updateStatus('Error');
+            addSystemMessage('DOM scan failed (filling may still work via direct ids).', 'warn');
         }
     });
 });
+
+async function pipelineScanFromBackend(requestContext) {
+    addSystemMessage('Calling local pipeline backend...', 'info');
+    updateStatus('Pipeline...');
+
+    const response = await chrome.runtime.sendMessage({
+        action: 'pipelineScan',
+        data: {
+            url: requestContext.url,
+            scanFieldCount: requestContext.scanFieldCount,
+            pageTitle: requestContext.pageTitle
+        }
+    });
+
+    if (response && response.success) {
+        const pipelineMaster = response.pipelineMaster;
+        const fillPlan = Array.isArray(response.fillPlan) ? response.fillPlan : [];
+        const counts = response.counts || {};
+
+        updateContextDisplay('pipelineMasterContext', JSON.stringify(pipelineMaster, null, 2));
+        updateContextDisplay('fillPlanContext', JSON.stringify(fillPlan, null, 2));
+
+        const filledCount = Array.isArray(pipelineMaster?.filled_fields) ? pipelineMaster.filled_fields.length : 0;
+        addSystemMessage(`Pipeline response received (${filledCount} fields). Stored as master JSON.`);
+        addAssistantMessage(`Pipeline response (master JSON):\n${JSON.stringify(pipelineMaster, null, 2)}`);
+        addSystemMessage(`Fill plan ready: ${counts.typeCount || 0} text, ${counts.selectCount || 0} selects, ${counts.checkCount || 0} checks, ${counts.uploadCount || 0} uploads.`);
+
+        // Enable fill buttons
+        if (window.ButtonManager) {
+            window.ButtonManager.enableButtons();
+        }
+        fillBtn.disabled = false;
+        updateStatus('Ready');
+    } else {
+        addSystemMessage(`Pipeline error: ${response?.error || 'Unknown error'}`, 'error');
+        updateStatus('Error');
+    }
+}
 
 // Analyze fields with AI
 async function analyzeFields(fields) {
@@ -112,6 +163,7 @@ fillBtn.addEventListener('click', async () => {
 
     updateStatus('Filling...');
     addSystemMessage('Starting form filling...');
+    addAssistantMessage(`Fill started.\nMode: Full\nItems: ${state.session.fillPlan.length}`);
 
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
@@ -125,9 +177,11 @@ fillBtn.addEventListener('click', async () => {
         if (response && response.success) {
             addSystemMessage('Filling complete!');
             updateStatus('Complete');
+            addAssistantMessage('Fill complete.');
         } else {
             addSystemMessage('Filling encountered errors', 'error');
             updateStatus('Error');
+            addAssistantMessage(`Fill error: ${response?.error || 'Unknown error'}`);
         }
     });
 
@@ -530,6 +584,15 @@ async function hydrateContextPanels() {
     if (state?.session?.lastAnalysis?.responseContext) {
         updateContextDisplay('llmResponseContext', JSON.stringify(state.session.lastAnalysis.responseContext, null, 2));
     }
+    if (state?.session?.pipeline?.requestContext) {
+        updateContextDisplay('pipelineRequestContext', JSON.stringify(state.session.pipeline.requestContext, null, 2));
+    }
+    if (state?.session?.pipeline?.master) {
+        updateContextDisplay('pipelineMasterContext', JSON.stringify(state.session.pipeline.master, null, 2));
+    }
+    if (Array.isArray(state?.session?.fillPlan)) {
+        updateContextDisplay('fillPlanContext', JSON.stringify(state.session.fillPlan, null, 2));
+    }
 
     const stored = await chrome.storage.local.get('resumeFile');
     if (state?.profile?.resumeText) {
@@ -543,16 +606,42 @@ async function hydrateContextPanels() {
 chrome.runtime.onMessage.addListener((message) => {
     if (message.action === 'notifySidePanel') {
         const { data } = message;
+        window.__pipelineChatFlags = window.__pipelineChatFlags || { firstError: false, firstFallback: false };
 
         switch (data.type) {
+            case 'fill_started':
+                addLog(`Fill started: ${data.mode || 'Full'}`, 'info');
+                addSystemMessage(`Fill started: ${data.mode || 'Full'}`);
+                break;
             case 'filling':
                 addLog(`Filling ${data.field}...`, 'info');
                 break;
             case 'filled':
                 addLog(`✓ Filled ${data.field}`, 'success');
                 break;
+            case 'select_fallback':
+                addLog(`Select fallback: "${data.requested}" → "${data.chosen}" (${data.field})`, 'warn');
+                if (!window.__pipelineChatFlags.firstFallback) {
+                    window.__pipelineChatFlags.firstFallback = true;
+                    addAssistantMessage(`Select fallback used for ${data.field}:\nRequested: ${data.requested}\nChosen: ${data.chosen}`);
+                }
+                break;
+            case 'element_not_found':
+                addLog(`Element not found: ${data.field} (${data.action || ''})`, 'error');
+                if (!window.__pipelineChatFlags.firstError) {
+                    window.__pipelineChatFlags.firstError = true;
+                    addAssistantMessage(`Element not found: ${data.field}\nAction: ${data.action || ''}`);
+                }
+                break;
+            case 'upload_needed':
+                addLog(`Upload needed: ${data.field}`, 'warn');
+                break;
             case 'error':
                 addLog(`✗ Error: ${data.error}`, 'error');
+                if (!window.__pipelineChatFlags.firstError) {
+                    window.__pipelineChatFlags.firstError = true;
+                    addAssistantMessage(`Fill error: ${data.error}`);
+                }
                 break;
             case 'captcha_detected':
                 addSystemMessage('⚠️ CAPTCHA detected! Please solve it and click Resume.');
@@ -563,6 +652,7 @@ chrome.runtime.onMessage.addListener((message) => {
             case 'complete':
                 addSystemMessage('✓ Form filling complete!');
                 updateStatus('Complete');
+                addAssistantMessage('Fill complete.');
                 break;
         }
     }
